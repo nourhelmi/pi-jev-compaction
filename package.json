@@ -1,0 +1,71 @@
+{
+  "name": "@nourhelmi/pi-jev-compaction",
+  "version": "0.1.0",
+  "description": "Automatic Jev context clearing for Pi. Keep the conversation, clear stale tool output, retrieve originals without rerunning commands.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Nour Helmi",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nourhelmi/pi-jev-compaction.git"
+  },
+  "homepage": "https://github.com/nourhelmi/pi-jev-compaction#readme",
+  "bugs": {
+    "url": "https://github.com/nourhelmi/pi-jev-compaction/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "jev",
+    "typesafe",
+    "compaction",
+    "context"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "extensions",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/jev.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --import tsx --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-agent-core": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "0.85.1",
+    "@earendil-works/pi-ai": "0.85.1",
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@types/node": "22.20.1",
+    "tsx": "4.23.13",
+    "typebox": "1.3.24",
+    "typescript": "7.0.2"
+  }
+}
