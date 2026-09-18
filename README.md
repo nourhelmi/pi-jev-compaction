@@ -62,7 +62,7 @@ Evaluations are spaced by at least **8k estimated tokens of raw-context growth**
 
 **Use one history-rewriting extension at a time.** Disable competing compaction/provider-payload extensions, including Pi Meta Harness's `codex-compaction`, before using this as their replacement. Start a fresh session when switching away from provider-native encrypted checkpoints; this extension does not decode or migrate them. It never disables other extensions behind your back.
 
-Keep `jev_read` active. If your tool allowlist excludes it, no new clearing decisions are made.
+Keep `jev_read` active. If your tool allowlist excludes it, no new clearing decisions are made and existing masks stop applying until retrieval is enabled again.
 
 ## Configuration
 

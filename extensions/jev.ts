@@ -31,7 +31,7 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
   pi.on("session_compact", reset);
 
   pi.on("context", (event, ctx) => {
-    if (!config.apiKey) return;
+    if (!config.apiKey || !pi.getActiveTools().includes("jev_read")) return;
     return { messages: applyPruning(event.messages, ledger(ctx.sessionManager.getBranch())) };
   });
 
@@ -55,13 +55,23 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
     const signal = ctx.signal ? AbortSignal.any([ctx.signal, ownController.signal]) : ownController.signal;
     try {
       const result = await score(applyPruning(messages, refs), choices, config, signal, options.fetch);
-      if (signal.aborted || epoch !== ownEpoch || ctx.sessionManager.getLeafId() !== leaf) return;
+      if (signal.aborted || epoch !== ownEpoch || ctx.sessionManager.getLeafId() !== leaf
+        || !pi.getActiveTools().includes("jev_read")) return;
       const saved = choices.filter(item => result.refs.includes(item.ref))
         .reduce((sum, item) => sum + estimateTokens(item.result) - estimateTokens(applyPruning([item.result], new Set(result.refs))[0]!), 0);
-      if (result.refs.length) pi.appendEntry(ENTRY_TYPE, {
-        version: 1, refs: result.refs, model: config.model, evaluated: result.evaluated,
-        estimatedTokensCleared: saved, inputTokens: result.inputTokens,
-      });
+      if (result.refs.length) {
+        const entry = {
+          version: 1, refs: result.refs, model: config.model, evaluated: result.evaluated,
+          estimatedTokensCleared: saved, inputTokens: result.inputTokens,
+        };
+        try { pi.appendEntry(ENTRY_TYPE, entry); }
+        catch (error) {
+          // Pi inserts the same data object into memory before its disk write can fail.
+          // Invalidate that entry too, so context/reload never trusts an uncommitted mask.
+          entry.refs = [];
+          throw error;
+        }
+      }
       lastStatus = `${result.refs.length}/${result.evaluated} outputs cleared; ~${saved.toLocaleString()} context tokens removed`;
       warned = false;
       if (ctx.hasUI) ctx.ui.setStatus("pi-jev", `Jev: ${ledger(ctx.sessionManager.getBranch()).size} cleared`);

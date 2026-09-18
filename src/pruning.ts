@@ -155,7 +155,7 @@ export async function score(
     body: request.body, signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
   });
   if (!response.ok) throw new Error(`Jev HTTP ${response.status}`);
-  const data: unknown = await response.json();
+  const data: unknown = await response.json().catch(() => { throw new Error("Invalid Jev response JSON"); });
   if (!data || typeof data !== "object" || !("answers" in data) || !data.answers || typeof data.answers !== "object") {
     throw new Error("Invalid Jev response");
   }
