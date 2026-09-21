@@ -1,9 +1,25 @@
 import { Type } from "typebox";
-import { buildSessionContext, estimateTokens, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, estimateTokens, type ExtensionAPI, type ExtensionContext, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import {
   applyPruning, candidates, configuration, ENTRY_TYPE, GROWTH_TOKENS,
   ledger, original, score, textOf, type Config,
 } from "../src/pruning.ts";
+
+function clearedTokens(branch: readonly SessionEntry[]): number {
+  let total = 0;
+  for (const entry of branch) {
+    if (entry.type !== "custom" || entry.customType !== ENTRY_TYPE) continue;
+    const data = entry.data as { version?: unknown; estimatedTokensCleared?: unknown } | undefined;
+    if (data?.version === 1 && typeof data.estimatedTokensCleared === "number"
+      && Number.isFinite(data.estimatedTokensCleared) && data.estimatedTokensCleared > 0) total += data.estimatedTokensCleared;
+  }
+  return total;
+}
+
+function compactTokens(tokens: number): string {
+  if (tokens < 1_000) return tokens.toLocaleString();
+  return `${(tokens / 1_000).toFixed(tokens < 10_000 ? 1 : 0).replace(/\.0$/, "")}k`;
+}
 
 /** Injectable transport/configuration keep tests entirely offline. */
 export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?: typeof fetch } = {}): void {
@@ -13,6 +29,16 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
   let epoch = 0;
   let lastStatus = "No evaluation yet";
   let warned = false;
+  const updateStatus = (ctx: ExtensionContext) => {
+    if (!ctx.hasUI) return;
+    if (!config.apiKey) { ctx.ui.setStatus("pi-jev", "Jev: dormant"); return; }
+    const usage = ctx.getContextUsage();
+    const pressure = usage?.tokens !== null && usage?.tokens !== undefined && ctx.model?.contextWindow
+      ? `${(usage.tokens / ctx.model.contextWindow * 100).toFixed(1)}%`
+      : "waiting";
+    const saved = clearedTokens(ctx.sessionManager.getBranch());
+    ctx.ui.setStatus("pi-jev", `Jev: ${pressure}${saved ? ` · ~${compactTokens(saved)} cleared` : ""}`);
+  };
 
   const reset = () => {
     epoch++;
@@ -25,19 +51,26 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
   pi.on("session_start", (_event, ctx) => {
     reset();
     if (!config.apiKey && ctx.hasUI) ctx.ui.notify("pi-jev is dormant: set TYPESAFE_API_KEY and reload. Normal Pi compaction remains enabled.", "info");
+    updateStatus(ctx);
   });
-  pi.on("session_shutdown", reset);
-  pi.on("session_tree", reset);
-  pi.on("session_compact", reset);
+  pi.on("session_shutdown", (_event, ctx) => {
+    reset();
+    if (ctx.hasUI) ctx.ui.setStatus("pi-jev", undefined);
+  });
+  pi.on("session_tree", (_event, ctx) => { reset(); updateStatus(ctx); });
+  pi.on("session_compact", (_event, ctx) => { reset(); updateStatus(ctx); });
 
   pi.on("context", (event, ctx) => {
     if (!config.apiKey || !pi.getActiveTools().includes("jev_read")) return;
+    updateStatus(ctx);
     return { messages: applyPruning(event.messages, ledger(ctx.sessionManager.getBranch())) };
   });
 
   // Runs after tools, before the next assistant request. The context hook itself never makes a network call.
   pi.on("turn_end", async (_event, ctx) => {
-    if (!config.apiKey || controller || !ctx.model || !pi.getActiveTools().includes("jev_read")) return;
+    if (!config.apiKey) return;
+    updateStatus(ctx);
+    if (controller || !ctx.model || !pi.getActiveTools().includes("jev_read")) return;
     const usage = ctx.getContextUsage();
     if (!usage || usage.tokens === null || usage.tokens / ctx.model.contextWindow < config.threshold) return;
     const branch = ctx.sessionManager.getBranch();
@@ -74,7 +107,7 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
       }
       lastStatus = `${result.refs.length}/${result.evaluated} outputs cleared; ~${saved.toLocaleString()} context tokens removed`;
       warned = false;
-      if (ctx.hasUI) ctx.ui.setStatus("pi-jev", `Jev: ${ledger(ctx.sessionManager.getBranch()).size} cleared`);
+      updateStatus(ctx);
     } catch (error) {
       if (epoch !== ownEpoch || ownController.signal.aborted || ctx.signal?.aborted) return;
       lastStatus = error instanceof Error ? error.message : "Jev unavailable";
@@ -82,6 +115,7 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
       warned = true;
     } finally {
       if (controller === ownController) controller = undefined;
+      updateStatus(ctx);
     }
   });
 

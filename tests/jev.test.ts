@@ -42,11 +42,12 @@ function harness(fetcher: typeof fetch = fakeFetch(), settings = config, sm = Se
   const handlers = new Map<string, ((event: any, ctx: ExtensionContext) => any)[]>();
   const tools = new Map<string, ToolDefinition>();
   const notices: string[] = [];
+  const statuses: string[] = [];
   let pressure: number | null = 70_000;
   let active = ["jev_read"];
   const ctx = {
     sessionManager: sm, model: { contextWindow: 100_000 }, getContextUsage: () => pressure === null ? null : ({ tokens: pressure }),
-    hasUI: true, ui: { notify: (text: string) => notices.push(text), setStatus() {} },
+    hasUI: true, ui: { notify: (text: string) => notices.push(text), setStatus(_id: string, text?: string) { if (text) statuses.push(text); } },
   } as unknown as ExtensionContext;
   const pi = {
     on(name: string, fn: (event: unknown, ctx: ExtensionContext) => unknown) { handlers.set(name, [...(handlers.get(name) ?? []), fn]); },
@@ -55,7 +56,7 @@ function harness(fetcher: typeof fetch = fakeFetch(), settings = config, sm = Se
     registerCommand() {}, getActiveTools() { return active; },
   } as unknown as ExtensionAPI;
   registerJev(pi, { config: settings, fetch: fetcher });
-  return { sm, handlers, tools, notices, ctx, pi,
+  return { sm, handlers, tools, notices, statuses, ctx, pi,
     pressure(value: number | null) { pressure = value; }, active(value: string[]) { active = value; },
     async fire(type: string, event: any = {}) {
       let result: any;
@@ -146,6 +147,7 @@ test("automatic hook flow persists only masks and retrieval returns exact paged 
   const originalEntries = structuredClone(h.sm.getBranch());
   const wanted = candidates(messages, new Set(), 2_000)[0]!;
   await h.fire("turn_end");
+  assert.match(h.statuses.at(-1)!, /^Jev: 70\.0% · ~[\d.]+k cleared$/);
   assert.equal(requests, 1);
   assert.deepEqual(h.sm.getBranch().slice(0, originalEntries.length), originalEntries);
   assert.equal(ledger(h.sm.getBranch()).size, 2);
@@ -172,6 +174,7 @@ test("pressure, missing key, disabled retrieval, null usage and all-keep cooldow
   assert.equal(ledger(h.sm.getBranch()).size, 0);
   const missing = harness(fakeFetch(0, () => calls++), { ...config, apiKey: "" });
   await missing.fire("session_start"); await missing.fire("turn_end");
+  assert.equal(missing.statuses.at(-1), "Jev: dormant");
   assert.equal(await missing.fire("context", { messages: transcript() }), undefined);
   assert.equal(calls, 1);
 });
@@ -233,6 +236,7 @@ test("restart and branch navigation recover only branch-local masks and evidence
   const prunedLeaf = h.sm.getLeafId()!;
   await h.fire("session_start");
   assert.equal(ledger(h.sm.getBranch()).size, 2);
+  assert.match(h.statuses.at(-1)!, /cleared$/);
   assert.equal(original(h.sm.getBranch(), target.ref), target.result);
   h.sm.branch(forkPoint); await h.fire("session_tree");
   assert.equal(ledger(h.sm.getBranch()).size, 0);
