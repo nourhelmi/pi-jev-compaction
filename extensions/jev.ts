@@ -116,7 +116,9 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
 
   const updateStatus = (ctx: ExtensionContext) => {
     const saved = clearedTokens(ctx.sessionManager.getBranch());
+    const active = pi.getActiveTools().includes("jev_read");
     barLabel = !config.apiKey ? "Jev dormant"
+      : !active ? "Jev paused"
       : controller ? "Jev checking…"
       : warned ? "Jev error"
       : saved ? `Jev ~${compactTokens(saved)}`
@@ -124,6 +126,7 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
     if (editorInstalled && ctx.mode === "tui") { editorTui?.requestRender(); return; }
     if (!ctx.hasUI) return;
     if (!config.apiKey) { ctx.ui.setStatus("pi-jev", "Jev: dormant"); return; }
+    if (!active) { ctx.ui.setStatus("pi-jev", "Jev: paused · jev_read inactive"); return; }
     const usage = ctx.getContextUsage();
     const pressure = usage?.tokens !== null && usage?.tokens !== undefined && ctx.model?.contextWindow
       ? `${(usage.tokens / ctx.model.contextWindow * 100).toFixed(1)}%`
@@ -162,68 +165,89 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
     if (ctx.hasUI) ctx.ui.setStatus("pi-jev", undefined);
   });
   pi.on("session_tree", (_event, ctx) => { reset(); updateStatus(ctx); });
+  pi.on("session_before_compact", (_event, ctx) => { reset(); updateStatus(ctx); });
   pi.on("session_compact", (_event, ctx) => { reset(); updateStatus(ctx); });
 
-  pi.on("context", (event, ctx) => {
-    if (!config.apiKey || !pi.getActiveTools().includes("jev_read")) return;
-    updateStatus(ctx);
-    return { messages: applyPruning(event.messages, ledger(ctx.sessionManager.getBranch())) };
-  });
-
-  // Pi emits turn_end after each completed model/tool cycle inside the live agent loop and awaits
-  // this handler before the next context/provider request. This is deliberately not agent_end.
-  pi.on("turn_end", async (_event, ctx) => {
-    if (!config.apiKey) return;
-    updateStatus(ctx);
-    if (controller || !ctx.model || !pi.getActiveTools().includes("jev_read")) return;
-    const usage = ctx.getContextUsage();
-    if (!usage || usage.tokens === null || usage.tokens / ctx.model.contextWindow < config.threshold) return;
+  const startEvaluation = (ctx: ExtensionContext): void => {
+    if (!config.apiKey || controller || !ctx.model || !pi.getActiveTools().includes("jev_read")) return;
     const branch = ctx.sessionManager.getBranch();
     const messages = buildSessionContext(branch).messages;
     const rawTokens = messages.reduce((sum, message) => sum + estimateTokens(message), 0);
+    const usageTokens = ctx.getContextUsage()?.tokens ?? 0;
+    if (Math.max(rawTokens, usageTokens) / ctx.model.contextWindow < config.threshold) return;
     if (rawTokens >= lastAttemptTokens && rawTokens - lastAttemptTokens < GROWTH_TOKENS) return;
     lastAttemptTokens = rawTokens;
     const refs = ledger(branch);
     const choices = candidates(messages, refs, config.keepRecentTokens);
     if (!choices.length) { lastStatus = "No old eligible outputs"; return; }
+
     const ownController = new AbortController();
     controller = ownController;
-    updateStatus(ctx);
     const ownEpoch = epoch;
-    const leaf = ctx.sessionManager.getLeafId();
-    const signal = ctx.signal ? AbortSignal.any([ctx.signal, ownController.signal]) : ownController.signal;
-    try {
-      const result = await score(applyPruning(messages, refs), choices, config, signal, options.fetch);
-      if (signal.aborted || epoch !== ownEpoch || ctx.sessionManager.getLeafId() !== leaf
-        || !pi.getActiveTools().includes("jev_read")) return;
-      const saved = choices.filter(item => result.refs.includes(item.ref))
-        .reduce((sum, item) => sum + estimateTokens(item.result) - estimateTokens(applyPruning([item.result], new Set(result.refs))[0]!), 0);
-      if (result.refs.length) {
-        const entry = {
-          version: 1, refs: result.refs, model: config.model, evaluated: result.evaluated,
-          estimatedTokensCleared: saved, inputTokens: result.inputTokens,
-        };
-        try { pi.appendEntry(ENTRY_TYPE, entry); }
-        catch (error) {
-          // Pi advances its in-memory leaf before disk I/O. Invalidate the entry and restore the
-          // persisted branch head so later writes cannot become children of an unpersisted ID.
-          entry.refs = [];
-          restoreLeaf(ctx.sessionManager, leaf);
-          throw error;
+    const snapshotLeaf = ctx.sessionManager.getLeafId();
+    updateStatus(ctx);
+
+    void (async () => {
+      try {
+        const result = await score(applyPruning(messages, refs), choices, config, ownController.signal, options.fetch);
+        if (ownController.signal.aborted || epoch !== ownEpoch || !pi.getActiveTools().includes("jev_read")) return;
+        const currentBranch = ctx.sessionManager.getBranch();
+        const snapshotIndex = snapshotLeaf ? currentBranch.findIndex(entry => entry.id === snapshotLeaf) : -1;
+        if (snapshotLeaf && snapshotIndex < 0) return;
+        if (currentBranch.slice(snapshotIndex + 1).some(entry => entry.type === "message" && entry.message.role === "user")) {
+          lastAttemptTokens = -Infinity;
+          return;
         }
+        const currentRefs = ledger(currentBranch);
+        const currentMessages = buildSessionContext(currentBranch).messages;
+        const eligible = new Set(candidates(currentMessages, currentRefs, config.keepRecentTokens).map(item => item.ref));
+        const cleared = choices.filter(item => result.refs.includes(item.ref) && eligible.has(item.ref));
+        const clearedRefs = new Set(cleared.map(item => item.ref));
+        const saved = cleared.reduce((sum, item) => sum + estimateTokens(item.result)
+          - estimateTokens(applyPruning([item.result], clearedRefs)[0]!), 0);
+        if (cleared.length) {
+          const entry = {
+            version: 1, refs: [...clearedRefs], model: config.model, evaluated: result.evaluated,
+            estimatedTokensCleared: saved, inputTokens: result.inputTokens,
+          };
+          const commitLeaf = ctx.sessionManager.getLeafId();
+          try { pi.appendEntry(ENTRY_TYPE, entry); }
+          catch (error) {
+            // Pi advances its in-memory leaf before disk I/O. Invalidate the entry and restore the
+            // persisted branch head so later writes cannot become children of an unpersisted ID.
+            entry.refs = [];
+            restoreLeaf(ctx.sessionManager, commitLeaf);
+            throw error;
+          }
+        }
+        lastStatus = `${cleared.length}/${result.evaluated} outputs cleared; ~${saved.toLocaleString()} context tokens removed`;
+        warned = false;
+      } catch (error) {
+        if (epoch !== ownEpoch || ownController.signal.aborted) return;
+        lastStatus = error instanceof Error ? error.message : "Jev unavailable";
+        if (!warned && ctx.hasUI) ctx.ui.notify(`pi-jev: ${lastStatus}. Context unchanged; normal compaction remains available.`, "warning");
+        warned = true;
+      } finally {
+        if (controller === ownController) controller = undefined;
+        if (epoch === ownEpoch) updateStatus(ctx);
       }
-      lastStatus = `${result.refs.length}/${result.evaluated} outputs cleared; ~${saved.toLocaleString()} context tokens removed`;
-      warned = false;
-      updateStatus(ctx);
-    } catch (error) {
-      if (epoch !== ownEpoch || ownController.signal.aborted || ctx.signal?.aborted) return;
-      lastStatus = error instanceof Error ? error.message : "Jev unavailable";
-      if (!warned && ctx.hasUI) ctx.ui.notify(`pi-jev: ${lastStatus}. Context unchanged; normal compaction remains available.`, "warning");
-      warned = true;
-    } finally {
-      if (controller === ownController) controller = undefined;
-      updateStatus(ctx);
-    }
+    })();
+  };
+
+  pi.on("context", (event, ctx) => {
+    if (!config.apiKey) return;
+    updateStatus(ctx);
+    if (!pi.getActiveTools().includes("jev_read")) return;
+    const projected = applyPruning(event.messages, ledger(ctx.sessionManager.getBranch()));
+    startEvaluation(ctx);
+    return { messages: projected };
+  });
+
+  // Launch scoring at each live model/tool boundary, then let the next provider request proceed.
+  // A concurrent result is committed only while its candidates remain eligible on this branch.
+  pi.on("turn_end", (_event, ctx) => {
+    updateStatus(ctx);
+    startEvaluation(ctx);
   });
 
   pi.registerTool({
@@ -284,6 +308,7 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
     handler: async (_args, ctx) => {
       ctx.ui.notify([
         config.apiKey ? `Automatic at ${Math.round(config.threshold * 100)}% context · ${config.model}` : "Dormant: TYPESAFE_API_KEY is missing",
+        pi.getActiveTools().includes("jev_read") ? "Retrieval active" : "Paused: jev_read is inactive",
         `${ledger(ctx.sessionManager.getBranch()).size} cleared outputs on this branch`,
         lastStatus,
       ].join("\n"), "info");

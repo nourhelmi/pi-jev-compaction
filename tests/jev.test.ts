@@ -69,6 +69,7 @@ function harness(fetcher: typeof fetch = fakeFetch(), settings = config, sm = Se
     async fire(type: string, event: any = {}) {
       let result: any;
       for (const fn of handlers.get(type) ?? []) result = await fn(event, ctx);
+      if (type === "turn_end") await new Promise<void>(resolve => setImmediate(resolve));
       return result;
     },
   };
@@ -280,7 +281,7 @@ test("automatic hook flow persists only masks and retrieval returns exact paged 
   await assert.rejects(tool.execute("retrieve", { ref: "0".repeat(24) }, undefined, undefined, h.ctx), /not on this session branch/);
   await h.fire("context", { messages }); await h.fire("turn_end");
   assert.equal(requests, 1, "no network from context or unchanged turns");
-  assert.equal(h.handlers.has("session_before_compact"), false, "normal manual/threshold/overflow compaction stays authoritative");
+  assert.equal(h.handlers.has("session_before_compact"), true, "background scoring is cancelled before normal compaction mutates the branch");
 });
 
 test("branch-local reset releases masks append-only and keeps original evidence", async () => {
@@ -315,6 +316,7 @@ test("pressure, missing key, disabled retrieval, null usage and all-keep cooldow
   h.pressure(10_000); await h.fire("turn_end"); assert.equal(calls, 0);
   h.pressure(null); await h.fire("turn_end"); assert.equal(calls, 0);
   h.pressure(70_000); h.active([]); await h.fire("turn_end"); assert.equal(calls, 0);
+  assert.equal(h.statuses.at(-1), "Jev: paused · jev_read inactive");
   h.active(["jev_read"]); await h.fire("turn_end"); await h.fire("turn_end"); assert.equal(calls, 1);
   assert.equal(ledger(h.sm.getBranch()).size, 0);
   const missing = harness(fakeFetch(0, () => calls++), { ...config, apiKey: "" });
@@ -322,6 +324,35 @@ test("pressure, missing key, disabled retrieval, null usage and all-keep cooldow
   assert.equal(missing.statuses.at(-1), "Jev: dormant");
   assert.equal(await missing.fire("context", { messages: transcript() }), undefined);
   assert.equal(calls, 1);
+});
+
+test("evaluation never blocks a live-loop boundary", async () => {
+  let finish!: () => void;
+  const h = harness((async (_url, init) => {
+    await new Promise<void>(resolve => { finish = resolve; });
+    return fakeFetch()(_url, init);
+  }) as typeof fetch);
+  await h.fire("turn_end");
+  assert.equal(ledger(h.sm.getBranch()).size, 0, "the boundary returned while scoring remained unfinished");
+  finish();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(ledger(h.sm.getBranch()).size, 2);
+});
+
+test("context hook starts scoring without delaying provider context", async () => {
+  let finish!: () => void;
+  const h = harness((async (_url, init) => {
+    await new Promise<void>(resolve => { finish = resolve; });
+    return fakeFetch()(_url, init);
+  }) as typeof fetch);
+  h.pressure(null);
+  (h.ctx as any).model.contextWindow = 5_000;
+  const messages = h.sm.buildSessionContext().messages;
+  const first = await h.fire("context", { messages });
+  assert.match(JSON.stringify(first), /BEGIN_old/);
+  finish();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.match(JSON.stringify(await h.fire("context", { messages })), /older tool output cleared/);
 });
 
 test("disabled retrieval restores originals and prevents in-flight decisions", async () => {
@@ -442,6 +473,35 @@ test("late Jev results after a tree change cannot append decisions", async () =>
   const pending = h.fire("turn_end");
   await h.fire("session_tree"); finish(); await pending;
   assert.equal(ledger(h.sm.getBranch()).size, 0);
+});
+
+test("late Jev results cannot cross a user-task or compaction boundary", async () => {
+  const delayed = () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const h = harness((async (_url, init) => {
+      await gate;
+      return fakeFetch()(_url, init);
+    }) as typeof fetch);
+    return { h, release: () => release() };
+  };
+
+  const task = delayed();
+  await task.h.fire("turn_end");
+  task.h.sm.appendMessage({ role: "user", content: "Start a different task", timestamp: 99 });
+  task.release();
+  await new Promise<void>(resolve => setImmediate(() => setImmediate(resolve)));
+  assert.equal(ledger(task.h.sm.getBranch()).size, 0);
+  await task.h.fire("turn_end");
+  await new Promise<void>(resolve => setImmediate(() => setImmediate(resolve)));
+  assert.equal(ledger(task.h.sm.getBranch()).size, 2, "the new task is evaluated from a fresh snapshot");
+
+  const compact = delayed();
+  await compact.h.fire("turn_end");
+  await compact.h.fire("session_before_compact");
+  compact.release();
+  await new Promise<void>(resolve => setImmediate(() => setImmediate(resolve)));
+  assert.equal(ledger(compact.h.sm.getBranch()).size, 0);
 });
 
 test("configuration is bounded and ledger rejects unknown versions and malformed references", () => {

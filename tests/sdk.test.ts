@@ -35,7 +35,7 @@ test("Pi's resource loader loads the actual package entrypoint", async t => {
   assert.ok(loaded.extensions[0]!.handlers.has("turn_end"));
 });
 
-test("active Pi tool loop prunes before its next model request", async t => {
+test("active Pi tool loop scores concurrently and prunes a later model request", async t => {
   const dir = sandbox(t);
   const sm = SessionManager.inMemory(dir);
   const model: Model<"openai-responses"> = {
@@ -55,6 +55,8 @@ test("active Pi tool loop prunes before its next model request", async t => {
   sm.appendMessage(evidence);
   sm.appendMessage({ role: "user", content: "Latest context " + "recent ".repeat(2_000), timestamp: 2 });
   let evaluations = 0;
+  let releaseEvaluation!: () => void;
+  const evaluationGate = new Promise<void>(resolve => { releaseEvaluation = resolve; });
   const settings = SettingsManager.inMemory({ compaction: { enabled: true }, retry: { enabled: false } });
   const loader = new DefaultResourceLoader({
     cwd: dir, agentDir: dir, settingsManager: settings,
@@ -70,6 +72,7 @@ test("active Pi tool loop prunes before its next model request", async t => {
         fetch: (async (_url, init) => {
           evaluations++;
           const request = JSON.parse(String(init?.body));
+          await evaluationGate;
           return Response.json({
             model: "jev-fixture",
             answers: Object.fromEntries(Object.keys(request.questions).map(key => [key, { type: "noul", noul: 0.01 }])),
@@ -90,20 +93,28 @@ test("active Pi tool loop prunes before its next model request", async t => {
   session.agent.streamFunction = (_model, context) => {
     sent.push(JSON.stringify(context.messages));
     const stream = createAssistantMessageEventStream();
-    const toolUse = sent.length === 1;
+    const request = sent.length;
+    const toolUse = request < 3;
     const message = toolUse
-      ? assistant([{ type: "toolCall", id: "live-call", name: "fixture_output", arguments: {} }], 70_000, "toolUse")
+      ? assistant([{ type: "toolCall", id: `live-call-${request}`, name: "fixture_output", arguments: {} }], request === 1 ? 70_000 : 0, "toolUse")
       : assistant([{ type: "text", text: "Finished." }]);
-    stream.push({ type: "done", reason: toolUse ? "toolUse" : "stop", message });
-    stream.end(message);
+    const finish = () => {
+      stream.push({ type: "done", reason: toolUse ? "toolUse" : "stop", message });
+      stream.end(message);
+    };
+    if (request === 2) {
+      releaseEvaluation();
+      setImmediate(() => setImmediate(finish));
+    } else finish();
     return stream;
   };
   await session.prompt("Continue the work.");
-  assert.equal(sent.length, 2);
+  assert.equal(sent.length, 3);
   assert.equal(evaluations, 1);
   assert.equal(ledger(sm.getBranch()).size, 1);
   assert.match(sent[0]!, /ORIGINAL_EVIDENCE/);
-  assert.doesNotMatch(sent[1]!, /ORIGINAL_EVIDENCE/);
-  assert.match(sent[1]!, /jev_read/);
+  assert.match(sent[1]!, /ORIGINAL_EVIDENCE/, "the next request must not wait for unfinished scoring");
+  assert.doesNotMatch(sent[2]!, /ORIGINAL_EVIDENCE/);
+  assert.match(sent[2]!, /jev_read/);
   assert.match(evidence.content[0]!.text, /ORIGINAL_EVIDENCE/);
 });

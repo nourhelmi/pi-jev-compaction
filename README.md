@@ -16,7 +16,7 @@ pi
 
 Get a key from [TypeSafe](https://typesafe.ai). Set it in the environment where you launch Pi. Already running Pi? `/reload` reloads the extension, but a newly exported shell variable requires restarting Pi from that shell.
 
-That's it. Clearing runs automatically. Interactive Pi shows `Jev ready`, `Jev checking…`, or estimated cleared tokens such as `Jev ~18k` in the input editor's bottom border; `/jev-status` shows the full configuration and last result.
+That's it. Clearing runs automatically. Interactive Pi shows `Jev ready`, `Jev checking…`, `Jev paused`, or estimated cleared tokens such as `Jev ~18k` in the input editor's bottom border; `/jev-status` shows the full configuration and last result.
 
 ```sh
 pi remove git:github.com/nourhelmi/pi-jev-compaction
@@ -26,7 +26,7 @@ Requires Node.js **22.19+**. Tested against Pi **0.85.1**. Works with models run
 
 ## How it works
 
-1. After each completed model/tool cycle inside a live agent loop, before its next model request, evaluate once usage reaches **65% of the model's context window**.
+1. At live model/tool boundaries, once usage reaches **65% of the model's context window**, launch an evaluation concurrently with the next model request.
 2. Protect the latest **12k estimated tokens**, including complete parallel tool batches.
 3. Ask Jev about up to **16 large outputs**, sending bounded conversation, argument, and result excerpts in one request.
 4. Clear an output only when its estimated probability of still being needed is below **0.25**.
@@ -56,13 +56,13 @@ Only successful text outputs of at least **2,000 characters** are eligible. Unkn
 
 This is **context clearing before summarization**, not a promise of unlimited context.
 
-Pi's normal manual, threshold and overflow compaction remain unchanged. Missing key? The extension is dormant. API error, timeout or invalid answer? No new outputs are cleared. A large tool batch can still trigger ordinary compaction immediately.
+Pi's normal manual, threshold and overflow compaction remain unchanged. Missing key? The extension is dormant. API error, timeout or invalid answer? No new outputs are cleared. Evaluation never delays the next provider request: a result applies to the next request available after it finishes, so a fast tool loop may carry the old output for one more cycle. Nothing can alter a provider request already in flight. Results are discarded if the branch changes, a new user task starts, or compaction begins; a large tool batch can still trigger ordinary compaction first.
 
 Evaluations are spaced by at least **8k estimated tokens of raw-context growth**. Stable decisions are reapplied locally without another API call. Changing old output invalidates the cached prompt prefix from that point onward; fewer context tokens do not automatically mean a cheaper session.
 
 **Use one history-rewriting extension at a time.** Disable competing compaction/provider-payload extensions, including Pi Meta Harness's `codex-compaction`, before using this as their replacement. Start a fresh session when switching away from provider-native encrypted checkpoints; this extension does not decode or migrate them. It never disables other extensions behind your back.
 
-Keep `jev_read` active. If your tool allowlist excludes it, no new clearing decisions are made and existing masks stop applying until retrieval is enabled again.
+Keep `jev_read` active. If your tool allowlist excludes it, the frame shows `Jev paused`, no new clearing decisions are made, and existing masks stop applying until retrieval is enabled again.
 
 ## Configuration
 
