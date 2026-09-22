@@ -1,9 +1,65 @@
 import { Type } from "typebox";
-import { buildSessionContext, estimateTokens, type ExtensionAPI, type ExtensionContext, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import {
+  CustomEditor, buildSessionContext, estimateTokens, type ExtensionAPI, type ExtensionContext, type SessionEntry,
+} from "@earendil-works/pi-coding-agent";
 import {
   applyPruning, candidates, configuration, ENTRY_TYPE, GROWTH_TOKENS,
   ledger, original, score, textOf, type Config,
 } from "../src/pruning.ts";
+
+const EDITOR_COMPONENT_CHANGED_EVENT = "ui-pack:v1:editor-component-changed";
+const JEV_EDITOR_FACTORY = "__piJevEditorFactory";
+const JEV_EDITOR_LISTENER = Symbol.for("pi-jev.editorChangedListener");
+const ANSI = /\x1b\[[0-?]*[ -/]*[@-~]/g;
+
+type EditorFactory = NonNullable<ReturnType<ExtensionContext["ui"]["getEditorComponent"]>>;
+type EditorInstance = ReturnType<EditorFactory>;
+interface MarkedEditorFactory extends Function { __piJevEditorFactory?: true; }
+
+function isJevEditorFactory(value: unknown): boolean {
+  return typeof value === "function" && (value as MarkedEditorFactory).__piJevEditorFactory === true;
+}
+
+export function injectJevEditorStatus(
+  lines: readonly string[], label: string, style: (text: string) => string = text => text,
+): string[] {
+  let bottom = -1;
+  for (let i = lines.length - 1; i > 0; i--) {
+    const plain = lines[i]!.replace(ANSI, "");
+    if (/^[╰└┗][─━]+/.test(plain) || /^[─━]+$/.test(plain)) { bottom = i; break; }
+  }
+  if (bottom < 0) return [...lines];
+
+  const text = ` ${label} · `;
+  const line = lines[bottom]!;
+  const run = /(─+|━+)/.exec(line);
+  if (!run || run[0].length <= text.length + 1) return [...lines];
+
+  const output = [...lines];
+  output[bottom] = line.slice(0, run.index)
+    + run[0].slice(0, -text.length) + style(text)
+    + line.slice(run.index + run[0].length);
+  return output;
+}
+
+function editorWithStatus(
+  inner: EditorInstance,
+  label: () => string,
+  theme: ExtensionContext["ui"]["theme"],
+): EditorInstance {
+  return new Proxy(inner, {
+    get(target, property) {
+      if (property === "render") {
+        return (width: number) => injectJevEditorStatus(
+          target.render(width), label(), text => theme.fg("muted", text),
+        );
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+    set: (target, property, value) => Reflect.set(target, property, value, target),
+  });
+}
 
 function clearedTokens(branch: readonly SessionEntry[]): number {
   let total = 0;
@@ -29,16 +85,52 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
   let epoch = 0;
   let lastStatus = "No evaluation yet";
   let warned = false;
+  let barLabel = config.apiKey ? "Jev ready" : "Jev dormant";
+  let editorTui: { requestRender(): void } | undefined;
+  let editorInstalled = false;
+
+  const installEditorStatus = (ctx: ExtensionContext): boolean => {
+    if (ctx.mode !== "tui") return false;
+    const current = ctx.ui.getEditorComponent();
+    if (isJevEditorFactory(current)) return true;
+
+    const factory: EditorFactory = (tui, theme, keybindings) => {
+      editorTui = tui;
+      const inner = current?.(tui, theme, keybindings) ?? new CustomEditor(tui, theme, keybindings);
+      return editorWithStatus(inner, () => barLabel, ctx.ui.theme);
+    };
+    Object.defineProperty(factory, JEV_EDITOR_FACTORY, { value: true });
+    ctx.ui.setEditorComponent(factory);
+    ctx.ui.setStatus("pi-jev", undefined);
+    return true;
+  };
+
   const updateStatus = (ctx: ExtensionContext) => {
+    const saved = clearedTokens(ctx.sessionManager.getBranch());
+    barLabel = !config.apiKey ? "Jev dormant"
+      : controller ? "Jev checking…"
+      : warned ? "Jev error"
+      : saved ? `Jev ~${compactTokens(saved)}`
+      : "Jev ready";
+    if (editorInstalled && ctx.mode === "tui") { editorTui?.requestRender(); return; }
     if (!ctx.hasUI) return;
     if (!config.apiKey) { ctx.ui.setStatus("pi-jev", "Jev: dormant"); return; }
     const usage = ctx.getContextUsage();
     const pressure = usage?.tokens !== null && usage?.tokens !== undefined && ctx.model?.contextWindow
       ? `${(usage.tokens / ctx.model.contextWindow * 100).toFixed(1)}%`
       : "waiting";
-    const saved = clearedTokens(ctx.sessionManager.getBranch());
     ctx.ui.setStatus("pi-jev", `Jev: ${pressure}${saved ? ` · ~${compactTokens(saved)} cleared` : ""}`);
   };
+
+  const globals = globalThis as Record<PropertyKey, unknown>;
+  const previousListener = globals[JEV_EDITOR_LISTENER];
+  if (typeof previousListener === "function") previousListener();
+  const disposeEditorListener = pi.events?.on(EDITOR_COMPONENT_CHANGED_EVENT, payload => {
+    try { editorInstalled = installEditorStatus(payload as ExtensionContext); }
+    catch { /* A stale session context can outlive an editor-change event. */ }
+  });
+  if (disposeEditorListener) globals[JEV_EDITOR_LISTENER] = disposeEditorListener;
+  else delete globals[JEV_EDITOR_LISTENER];
 
   const reset = () => {
     epoch++;
@@ -50,11 +142,14 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
   };
   pi.on("session_start", (_event, ctx) => {
     reset();
+    editorInstalled = installEditorStatus(ctx);
     if (!config.apiKey && ctx.hasUI) ctx.ui.notify("pi-jev is dormant: set TYPESAFE_API_KEY and reload. Normal Pi compaction remains enabled.", "info");
     updateStatus(ctx);
   });
   pi.on("session_shutdown", (_event, ctx) => {
     reset();
+    editorInstalled = false;
+    editorTui = undefined;
     if (ctx.hasUI) ctx.ui.setStatus("pi-jev", undefined);
   });
   pi.on("session_tree", (_event, ctx) => { reset(); updateStatus(ctx); });
@@ -83,6 +178,7 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
     if (!choices.length) { lastStatus = "No old eligible outputs"; return; }
     const ownController = new AbortController();
     controller = ownController;
+    updateStatus(ctx);
     const ownEpoch = epoch;
     const leaf = ctx.sessionManager.getLeafId();
     const signal = ctx.signal ? AbortSignal.any([ctx.signal, ownController.signal]) : ownController.signal;

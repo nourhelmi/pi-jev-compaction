@@ -16,7 +16,7 @@ pi
 
 Get a key from [TypeSafe](https://typesafe.ai). Set it in the environment where you launch Pi. Already running Pi? `/reload` reloads the extension, but a newly exported shell variable requires restarting Pi from that shell.
 
-That's it. Clearing runs automatically. The Pi footer shows current context pressure and estimated context tokens cleared; `/jev-status` shows the full configuration and last result.
+That's it. Clearing runs automatically. Interactive Pi shows `Jev ready`, `Jev checking…`, or estimated cleared tokens such as `Jev ~18k` in the input editor's bottom border; `/jev-status` shows the full configuration and last result.
 
 ```sh
 pi remove git:github.com/nourhelmi/pi-jev-compaction

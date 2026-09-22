@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { SessionManager, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { registerJev } from "../extensions/jev.ts";
+import { injectJevEditorStatus, registerJev } from "../extensions/jev.ts";
 import {
   applyPruning, candidates, configuration, ENTRY_TYPE, ledger, MAX_REQUEST_BYTES,
   original, reference, requestBody, score, textOf, type Config, type ToolResult,
@@ -65,6 +65,21 @@ function harness(fetcher: typeof fetch = fakeFetch(), settings = config, sm = Se
     },
   };
 }
+
+test("editor indicator shares the bottom frame without changing its width", () => {
+  const stripAnsi = (text: string) => text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+  const lines = [
+    `\x1b[31m┏${"━".repeat(42)}┓\x1b[0m`,
+    "input",
+    `\x1b[31m┗${"━".repeat(28)}\x1b[0m xhigh \x1b[31m━┛\x1b[0m`,
+  ];
+  const framed = injectJevEditorStatus(lines, "Jev ~18k", text => `\x1b[2m${text}\x1b[0m`);
+  assert.equal(framed[0], lines[0]);
+  assert.equal(framed[1], lines[1]);
+  assert.equal(stripAnsi(framed[2]!).length, stripAnsi(lines[2]!).length);
+  assert.match(stripAnsi(framed[2]!), /Jev ~18k · .*xhigh/);
+  assert.deepEqual(injectJevEditorStatus(["top", "┗━━┛"], "Jev ready"), ["top", "┗━━┛"]);
+});
 
 test("candidate selection protects recent batches, errors, skills, images, tool loading, coordination and ambiguous pairs", () => {
   const messages = transcript();
