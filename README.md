@@ -26,7 +26,7 @@ Requires Node.js **22.19+**. Tested against Pi **0.85.1**. Works with models run
 
 ## How it works
 
-1. After a tool turn reaches **65% of the model's context window**, inspect older successful text outputs.
+1. After each completed model/tool cycle inside a live agent loop, before its next model request, evaluate once usage reaches **65% of the model's context window**.
 2. Protect the latest **12k estimated tokens**, including complete parallel tool batches.
 3. Ask Jev about up to **16 large outputs**, sending bounded conversation, argument, and result excerpts in one request.
 4. Clear an output only when its estimated probability of still being needed is below **0.25**.
@@ -41,7 +41,7 @@ Retrieve with jev_read({"ref":"…"}). Do not rerun a side-effecting command to 
 
 The `jev_read` tool returns the original stored output in bounded pages. It does not reread a potentially changed file, rerun a deployment, or search another session. Retrieval works from the active session branch, including after normal compaction.
 
-Clearing decisions are small append-only session entries. Reloads and branches recover their own decisions; original message records are never rewritten. Removing the extension stops applying these masks. Normal Pi summaries already created remain summaries.
+Clearing decisions are small append-only session entries. Reloads and branches recover their own decisions; original message records are never rewritten. `/jev-reset` appends a branch-local reset that releases every current mask without deleting evidence or history. Removing the extension also stops applying masks. Normal Pi summaries already created remain summaries.
 
 ## What stays
 
@@ -50,7 +50,7 @@ Clearing decisions are small append-only session entries. Reloads and branches r
 - Skill/`AGENTS.md` reads, deferred-tool loading results, `jev_read` responses.
 - Known background-agent, advisor, memory, goal, task and coordination tool outputs.
 
-Only successful text outputs of at least **2,000 characters** are eligible. Unknown or ambiguous call/result pairing is left alone. Jev sees excerpts, not complete evidence, and can make relevance mistakes; the retrieval tool exists for that reason.
+Only successful text outputs of at least **2,000 characters** are eligible. Unknown or ambiguous call/result pairing, credential-file access, and outputs containing obvious secret patterns are left alone. Jev sees excerpts, not complete evidence, and can make relevance mistakes; the retrieval tool exists for that reason.
 
 ## Compaction and caching
 
@@ -87,7 +87,7 @@ Each request includes:
 - Candidate tool names and truncated arguments, up to roughly 400 characters each.
 - Candidate result head/tail excerpts, up to roughly 800 characters each, plus output length.
 
-The complete serialized request is capped at **24,000 UTF-8 bytes**. Thinking blocks, signatures, images, tool-result `details`, system instructions and custom-message contents are excluded. **Ordinary text and arguments can still contain private code or secrets; this is not a redaction service.** Requests are billed separately by TypeSafe. Keys and response bodies are not logged.
+The complete serialized request is capped at **24,000 UTF-8 bytes**. Thinking blocks, signatures, images, tool-result `details`, system instructions and custom-message contents are excluded. Common private-key, provider-token, bearer-token and credential-assignment patterns are redacted from uploaded excerpts, and obvious credential-file candidates are excluded. This is heuristic protection, not a general secret scanner—do not put credentials in prompts or ordinary text. Responses are capped at **64,000 bytes** and redirects are refused. Requests are billed separately by TypeSafe. Keys and response bodies are not logged.
 
 ## Development
 

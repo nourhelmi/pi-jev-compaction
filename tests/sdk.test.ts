@@ -9,6 +9,7 @@ import type { AssistantMessage, Model } from "@earendil-works/pi-ai/compat";
 import {
   createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import { registerJev } from "../extensions/jev.ts";
 import { configuration, ledger } from "../src/pruning.ts";
 
@@ -34,7 +35,7 @@ test("Pi's resource loader loads the actual package entrypoint", async t => {
   assert.ok(loaded.extensions[0]!.handlers.has("turn_end"));
 });
 
-test("real Pi agent loop prunes automatically before the next model request", async t => {
+test("active Pi tool loop prunes before its next model request", async t => {
   const dir = sandbox(t);
   const sm = SessionManager.inMemory(dir);
   const model: Model<"openai-responses"> = {
@@ -42,9 +43,9 @@ test("real Pi agent loop prunes automatically before the next model request", as
     reasoning: false, input: ["text"], contextWindow: 100_000, maxTokens: 4_096,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
   };
-  const assistant = (content: AssistantMessage["content"], input = 0): AssistantMessage => ({
+  const assistant = (content: AssistantMessage["content"], input = 0, stopReason: "stop" | "toolUse" = "stop"): AssistantMessage => ({
     role: "assistant", content, api: model.api, provider: model.provider, model: model.id,
-    stopReason: "stop", timestamp: Date.now(),
+    stopReason, timestamp: Date.now(),
     usage: { input, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: input + 1, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
   });
   sm.appendMessage({ role: "user", content: "Inspect source then fix it", timestamp: 0 });
@@ -58,14 +59,25 @@ test("real Pi agent loop prunes automatically before the next model request", as
   const loader = new DefaultResourceLoader({
     cwd: dir, agentDir: dir, settingsManager: settings,
     noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
-    extensionFactories: [pi => registerJev(pi, {
-      config: { ...configuration({}), apiKey: "fixture", keepRecentTokens: 2_000 },
-      fetch: (async (_url, init) => {
-        evaluations++;
-        const request = JSON.parse(String(init?.body));
-        return Response.json({ answers: Object.fromEntries(Object.keys(request.questions).map(key => [key, { noul: 0.01 }])) });
-      }) as typeof fetch,
-    })],
+    extensionFactories: [
+      pi => pi.registerTool({
+        name: "fixture_output", label: "Fixture output", description: "Return fixture output.",
+        parameters: Type.Object({}),
+        async execute() { return { content: [{ type: "text" as const, text: "fresh output" }], details: {} }; },
+      }),
+      pi => registerJev(pi, {
+        config: { ...configuration({}), apiKey: "fixture", keepRecentTokens: 2_000 },
+        fetch: (async (_url, init) => {
+          evaluations++;
+          const request = JSON.parse(String(init?.body));
+          return Response.json({
+            model: "jev-fixture",
+            answers: Object.fromEntries(Object.keys(request.questions).map(key => [key, { type: "noul", noul: 0.01 }])),
+            usage: { input_tokens: 1, output_tokens: 1 },
+          });
+        }) as typeof fetch,
+      }),
+    ],
   });
   await loader.reload();
   const runtime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: join(dir, "models.json"), modelsStorePath: join(dir, "models-store.json") });
@@ -78,19 +90,20 @@ test("real Pi agent loop prunes automatically before the next model request", as
   session.agent.streamFunction = (_model, context) => {
     sent.push(JSON.stringify(context.messages));
     const stream = createAssistantMessageEventStream();
-    const message = assistant([{ type: "text", text: "Continuing." }], 70_000);
-    stream.push({ type: "done", reason: "stop", message });
+    const toolUse = sent.length === 1;
+    const message = toolUse
+      ? assistant([{ type: "toolCall", id: "live-call", name: "fixture_output", arguments: {} }], 70_000, "toolUse")
+      : assistant([{ type: "text", text: "Finished." }]);
+    stream.push({ type: "done", reason: toolUse ? "toolUse" : "stop", message });
     stream.end(message);
     return stream;
   };
   await session.prompt("Continue the work.");
+  assert.equal(sent.length, 2);
   assert.equal(evaluations, 1);
   assert.equal(ledger(sm.getBranch()).size, 1);
-  await session.prompt("Continue once more.");
-  assert.equal(sent.length, 2);
   assert.match(sent[0]!, /ORIGINAL_EVIDENCE/);
   assert.doesNotMatch(sent[1]!, /ORIGINAL_EVIDENCE/);
   assert.match(sent[1]!, /jev_read/);
-  assert.equal(evaluations, 1);
   assert.match(evidence.content[0]!.text, /ORIGINAL_EVIDENCE/);
 });

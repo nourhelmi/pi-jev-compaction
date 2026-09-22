@@ -1,6 +1,6 @@
 import { Type } from "typebox";
 import {
-  CustomEditor, buildSessionContext, estimateTokens, type ExtensionAPI, type ExtensionContext, type SessionEntry,
+  CustomEditor, buildSessionContext, estimateTokens, type ExtensionAPI, type ExtensionContext, type SessionEntry, type SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import {
   applyPruning, candidates, configuration, ENTRY_TYPE, GROWTH_TOKENS,
@@ -65,11 +65,20 @@ function clearedTokens(branch: readonly SessionEntry[]): number {
   let total = 0;
   for (const entry of branch) {
     if (entry.type !== "custom" || entry.customType !== ENTRY_TYPE) continue;
-    const data = entry.data as { version?: unknown; estimatedTokensCleared?: unknown } | undefined;
-    if (data?.version === 1 && typeof data.estimatedTokensCleared === "number"
+    const data = entry.data as { version?: unknown; refs?: unknown; reset?: unknown; estimatedTokensCleared?: unknown } | undefined;
+    if (data?.version !== 1) continue;
+    if (data.reset === true && Array.isArray(data.refs) && data.refs.length === 0) { total = 0; continue; }
+    if (typeof data.estimatedTokensCleared === "number"
       && Number.isFinite(data.estimatedTokensCleared) && data.estimatedTokensCleared > 0) total += data.estimatedTokensCleared;
   }
   return total;
+}
+
+function restoreLeaf(manager: ExtensionContext["sessionManager"], leaf: string | null): void {
+  // SAFETY: ExtensionContext exposes the concrete SessionManager as read-only, but appendEntry
+  // mutates that same instance before persistence, so rollback must use its public leaf methods.
+  const mutable = manager as unknown as Pick<SessionManager, "branch" | "resetLeaf">;
+  if (leaf) mutable.branch(leaf); else mutable.resetLeaf();
 }
 
 function compactTokens(tokens: number): string {
@@ -161,7 +170,8 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
     return { messages: applyPruning(event.messages, ledger(ctx.sessionManager.getBranch())) };
   });
 
-  // Runs after tools, before the next assistant request. The context hook itself never makes a network call.
+  // Pi emits turn_end after each completed model/tool cycle inside the live agent loop and awaits
+  // this handler before the next context/provider request. This is deliberately not agent_end.
   pi.on("turn_end", async (_event, ctx) => {
     if (!config.apiKey) return;
     updateStatus(ctx);
@@ -195,9 +205,10 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
         };
         try { pi.appendEntry(ENTRY_TYPE, entry); }
         catch (error) {
-          // Pi inserts the same data object into memory before its disk write can fail.
-          // Invalidate that entry too, so context/reload never trusts an uncommitted mask.
+          // Pi advances its in-memory leaf before disk I/O. Invalidate the entry and restore the
+          // persisted branch head so later writes cannot become children of an unpersisted ID.
           entry.refs = [];
+          restoreLeaf(ctx.sessionManager, leaf);
           throw error;
         }
       }
@@ -236,6 +247,35 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
         content: [{ type: "text", text: `[Original ${result.toolName} output; characters ${offset}–${end} of ${text.length}]\n${text.slice(offset, end)}` }],
         details: { ref: args.ref, offset, nextOffset: end < text.length ? end : null, totalCharacters: text.length },
       };
+    },
+  });
+
+  pi.registerCommand("jev-reset", {
+    description: "Release all Jev-cleared outputs on the active branch",
+    handler: async (_args, ctx) => {
+      const released = ledger(ctx.sessionManager.getBranch()).size;
+      reset();
+      if (!released) {
+        lastStatus = "No cleared outputs to release";
+        updateStatus(ctx);
+        ctx.ui.notify(lastStatus, "info");
+        return;
+      }
+      const entry = { version: 1, refs: [] as string[], reset: true };
+      const leaf = ctx.sessionManager.getLeafId();
+      try { pi.appendEntry(ENTRY_TYPE, entry); }
+      catch {
+        entry.reset = false;
+        restoreLeaf(ctx.sessionManager, leaf);
+        lastStatus = "Could not persist mask reset";
+        warned = true;
+        updateStatus(ctx);
+        ctx.ui.notify(`pi-jev: ${lastStatus}; existing masks remain active.`, "warning");
+        return;
+      }
+      lastStatus = `${released} cleared outputs released on this branch`;
+      updateStatus(ctx);
+      ctx.ui.notify(`pi-jev: ${lastStatus}.`, "info");
     },
   });
 

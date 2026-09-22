@@ -7,13 +7,13 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { SessionManager, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { injectJevEditorStatus, registerJev } from "../extensions/jev.ts";
 import {
-  applyPruning, candidates, configuration, ENTRY_TYPE, ledger, MAX_REQUEST_BYTES,
+  applyPruning, candidates, configuration, ENTRY_TYPE, ledger, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
   original, reference, requestBody, score, textOf, type Config, type ToolResult,
 } from "../src/pruning.ts";
 
 const config: Config = { ...configuration({}), apiKey: "test-key", keepRecentTokens: 2_000 };
 type StoredMessage = Parameters<SessionManager["appendMessage"]>[0];
-function pair(id: string, name = "read", input = { path: `${id}.ts` }): StoredMessage[] {
+function pair(id: string, name = "read", input: Record<string, unknown> = { path: `${id}.ts` }): StoredMessage[] {
   return [{
     role: "assistant", content: [
       { type: "thinking", thinking: "PRIVATE_REASONING", thinkingSignature: "PRIVATE_SIGNATURE" },
@@ -30,17 +30,25 @@ function transcript(): StoredMessage[] {
     { role: "custom", customType: "checkpoint", content: "PRIVATE_CHECKPOINT", display: false, timestamp: 3 },
     { role: "user", content: "Current task: finish the parser. " + "recent work ".repeat(1_000), timestamp: 4 }];
 }
+function response(body: Record<string, any>, probability = 0.1): Record<string, unknown> {
+  return {
+    model: "jev-1.13.0",
+    answers: Object.fromEntries(Object.keys(body.questions).map(key => [key, { type: "noul", noul: probability }])),
+    usage: { input_tokens: 100, output_tokens: 10 },
+  };
+}
 function fakeFetch(probability = 0.1, inspect?: (body: Record<string, any>, init: RequestInit) => void): typeof fetch {
   return (async (_url, init) => {
     const body = JSON.parse(String(init?.body));
     inspect?.(body, init!);
-    return Response.json({ answers: Object.fromEntries(Object.keys(body.questions).map(key => [key, { noul: probability }])), usage: { input_tokens: 100 } });
+    return Response.json(response(body, probability));
   }) as typeof fetch;
 }
 function harness(fetcher: typeof fetch = fakeFetch(), settings = config, sm = SessionManager.inMemory("/tmp/pi-jev-test")) {
   for (const message of transcript()) sm.appendMessage(message);
   const handlers = new Map<string, ((event: any, ctx: ExtensionContext) => any)[]>();
   const tools = new Map<string, ToolDefinition>();
+  const commands = new Map<string, { handler(args: string, ctx: ExtensionContext): Promise<void> }>();
   const notices: string[] = [];
   const statuses: string[] = [];
   let pressure: number | null = 70_000;
@@ -53,10 +61,10 @@ function harness(fetcher: typeof fetch = fakeFetch(), settings = config, sm = Se
     on(name: string, fn: (event: unknown, ctx: ExtensionContext) => unknown) { handlers.set(name, [...(handlers.get(name) ?? []), fn]); },
     appendEntry(type: string, data: unknown) { sm.appendCustomEntry(type, data); },
     registerTool(tool: ToolDefinition) { tools.set(tool.name, tool); },
-    registerCommand() {}, getActiveTools() { return active; },
+    registerCommand(name: string, command: { handler(args: string, ctx: ExtensionContext): Promise<void> }) { commands.set(name, command); }, getActiveTools() { return active; },
   } as unknown as ExtensionAPI;
   registerJev(pi, { config: settings, fetch: fetcher });
-  return { sm, handlers, tools, notices, statuses, ctx, pi,
+  return { sm, handlers, tools, commands, notices, statuses, ctx, pi,
     pressure(value: number | null) { pressure = value; }, active(value: string[]) { active = value; },
     async fire(type: string, event: any = {}) {
       let result: any;
@@ -87,9 +95,32 @@ test("candidate selection protects recent batches, errors, skills, images, tool 
   const error = pair("error"); (error[1] as ToolResult).isError = true;
   const image = pair("image"); (image[1] as ToolResult).content.push({ type: "image", data: "PRIVATE_IMAGE", mimeType: "image/png" });
   const loaded = pair("loaded"); Object.assign(loaded[1]!, { addedToolNames: ["new_tool"] });
+  const reversed = pair("reversed");
+  const mismatch = pair("mismatch"); (mismatch[1] as ToolResult).toolName = "bash";
+  const separated = pair("separated");
+  const malformedDuplicates = [null, [], "bad"].flatMap((arguments_, index) => {
+    const messages = pair(`malformed-${index}`);
+    (messages[0] as Extract<AgentMessage, { role: "assistant" }>).content.push({
+      type: "toolCall", id: `malformed-${index}`, name: "read", arguments: arguments_ as any,
+    });
+    return messages;
+  });
+  const secretOutput = pair("secret-output");
+  (secretOutput[1] as ToolResult).content = [{ type: "text", text: `apiKey=sk-${"x".repeat(32)}\n${"data\n".repeat(600)}` }];
+  const partialKey = pair("partial-key", "read", { path: "dump.txt" });
+  (partialKey[1] as ToolResult).content = [{ type: "text", text: `-----BEGIN PRIVATE KEY-----\n${"A".repeat(2_500)}` }];
   const skipped = [...error, ...image, ...loaded, ...pair("skill", "read", { path: "/skills/test/SKILL.md" }),
+    ...pair("environment", "read", { path: "/repo/.env.production" }),
+    ...pair("at-environment", "read", { path: "@.env" }),
+    ...pair("pem", "read", { path: "tls/server.pem", limit: 40 }),
+    ...pair("api-field", "read", { apiKey: "opaquecredential123456" }),
+    ...pair("nested-field", "read", { credentials: { password: "correct horse battery staple" } }),
+    ...pair("env-field", "read", { env: { TYPESAFE_API_KEY: "opaquecredential123456" } }),
+    ...pair("credential", "bash", { command: "cat ~/.aws/credentials" }), ...secretOutput, ...partialKey,
     ...pair("job", "bg_agent"), ...pair("retrieval", "jev_read"), ...pair("orphan").slice(1),
-    ...pair("duplicate"), ...pair("duplicate"), messages.at(-1)!];
+    reversed[1]!, reversed[0]!, mismatch[0]!, mismatch[1]!, separated[0]!,
+    { role: "user" as const, content: "unrelated turn", timestamp: 2 }, separated[1]!,
+    ...pair("duplicate"), ...pair("duplicate"), ...malformedDuplicates, messages.at(-1)!];
   assert.deepEqual(candidates(skipped, new Set(), 2_000), []);
   const batch = pair("one");
   (batch[0] as Extract<AgentMessage, { role: "assistant" }>).content.push({ type: "toolCall", id: "two", name: "read", arguments: {} });
@@ -123,6 +154,25 @@ test("Jev requests contain bounded excerpts, not private reasoning, images, meta
   assert.match(request.body, /BEGIN_old/);
   assert.match(request.body, /END_old/);
   assert.doesNotMatch(request.body, /PRIVATE_|KEEP_SIGNATURE/);
+  const secret = `sk-${"a".repeat(32)}`;
+  const prefixed = "credential-value-without-a-known-token-prefix";
+  const phrase = "correct horse battery staple";
+  const apiField = "opaque-api-field-credential";
+  const nestedField = "opaque-nested-field-credential";
+  const envField = "opaque-env-field-credential";
+  const partialKey = `-----BEGIN PRIVATE KEY-----\n${"A".repeat(200)}`;
+  const redacted = requestBody([
+    ...messages, { role: "user", content: `Authorization: Bearer ${secret}\nTYPESAFE_API_KEY="${prefixed}"\nAWS_SECRET_ACCESS_KEY=${prefixed}`, timestamp: 5 },
+  ], [{ ...choices[0]!, input: {
+    note: `PASSWORD="${phrase}"`, apiKey: apiField,
+    credentials: { password: nestedField }, env: { TYPESAFE_API_KEY: envField },
+  }, result: {
+    ...choices[0]!.result, content: [{ type: "text" as const, text: `password=${secret}\n${partialKey}` }],
+  } }], config.model).body;
+  for (const value of [secret, prefixed, phrase, apiField, nestedField, envField, partialKey]) {
+    assert.doesNotMatch(redacted, new RegExp(value));
+  }
+  assert.match(redacted, /redacted/);
   const unicode = choices.map((item, i) => ({ ...item, ref: String(i), input: { path: "漢字".repeat(4_000) }, result: { ...item.result, content: [{ type: "text" as const, text: "漢字".repeat(5_000) }] } }));
   const many = Array.from({ length: 16 }, (_, i) => unicode[i % unicode.length]!);
   const bounded = requestBody(messages, many, config.model);
@@ -130,15 +180,69 @@ test("Jev requests contain bounded excerpts, not private reasoning, images, meta
   assert.ok(bounded.choices.length < 16);
 });
 
-test("scoring validates every probability before accepting a batch", async () => {
+test("scoring accepts only the documented closed response schema", async () => {
   const messages = transcript(), choices = candidates(messages, new Set(), 2_000);
   assert.equal((await score(messages, choices, config, undefined, fakeFetch())).refs.length, 2);
   assert.equal((await score(messages, choices, config, undefined, fakeFetch(0.9))).refs.length, 0);
-  for (const invalid of [{}, { answers: {} }, { answers: { r0: { noul: 0 }, r1: { noul: 2 } } }, { answers: { r0: { noul: -1 }, r1: { noul: 0 } } }]) {
-    await assert.rejects(score(messages, choices, config, undefined, (async () => Response.json(invalid)) as typeof fetch));
+  const body = JSON.parse(requestBody(messages, choices, config.model).body);
+  const valid = response(body);
+  const answer = { type: "noul", noul: 0 };
+  const invalid = [
+    {},
+    { ...valid, extra: true },
+    { ...valid, model: "gpt-4" },
+    { ...valid, answers: {} },
+    { ...valid, answers: { r0: answer, r1: { noul: 0 } } },
+    { ...valid, answers: { r0: answer, r1: { ...answer, confidence: 1 } } },
+    { ...valid, answers: { r0: answer, r1: { ...answer, noul: 2 } } },
+    { ...valid, usage: { input_tokens: 1 } },
+    { ...valid, usage: { input_tokens: 1.5, output_tokens: 1 } },
+  ];
+  for (const value of invalid) {
+    await assert.rejects(score(messages, choices, config, undefined, (async () => Response.json(value)) as typeof fetch));
   }
-  await assert.rejects(score(messages, choices, config, undefined, (async () => new Response("secret echoed by provider", { status: 429 })) as typeof fetch), error => String(error).includes("429") && !String(error).includes("secret"));
-  await assert.rejects(score(messages, choices, config, undefined, (async () => new Response("secret echoed by provider")) as typeof fetch), { message: "Invalid Jev response JSON" });
+  await assert.rejects(score(messages, choices, config, undefined,
+    (async () => new Response("secret echoed by provider", { status: 429 })) as typeof fetch),
+  error => String(error).includes("429") && !String(error).includes("secret"));
+  await assert.rejects(score(messages, choices, config, undefined,
+    (async () => new Response("not json")) as typeof fetch), { message: "Invalid Jev response JSON" });
+});
+
+test("transport refuses redirects, bounds streamed responses, and cancels aborted bodies", async () => {
+  const messages = transcript(), choices = candidates(messages, new Set(), 2_000);
+  let inspected = false;
+  await score(messages, choices, config, undefined, fakeFetch(0.1, (_body, init) => {
+    inspected = true;
+    assert.equal(init.redirect, "error");
+    assert.equal((init.headers as Record<string, string>).accept, "application/json");
+    assert.ok(init.signal);
+  }));
+  assert.equal(inspected, true);
+
+  await assert.rejects(score(messages, choices, config, undefined, (async () => new Response("x", {
+    headers: { "content-length": String(MAX_RESPONSE_BYTES + 1) },
+  })) as typeof fetch), /byte budget/);
+
+  let oversizedCancelled = false;
+  const oversized = new ReadableStream<Uint8Array>({
+    start(stream) {
+      stream.enqueue(new Uint8Array(MAX_RESPONSE_BYTES));
+      stream.enqueue(new Uint8Array(1));
+    },
+    cancel() { oversizedCancelled = true; },
+  });
+  await assert.rejects(score(messages, choices, config, undefined,
+    (async () => new Response(oversized)) as typeof fetch), /byte budget/);
+  assert.equal(oversizedCancelled, true);
+
+  let abortedCancelled = false;
+  const waiting = new ReadableStream<Uint8Array>({ cancel() { abortedCancelled = true; } });
+  const controller = new AbortController();
+  const pending = score(messages, choices, config, controller.signal,
+    (async () => new Response(waiting)) as typeof fetch);
+  controller.abort();
+  await assert.rejects(pending, { name: "AbortError" });
+  assert.equal(abortedCancelled, true);
 });
 
 test("HTTP requests have a deadline and propagate abort", async () => {
@@ -177,6 +281,32 @@ test("automatic hook flow persists only masks and retrieval returns exact paged 
   await h.fire("context", { messages }); await h.fire("turn_end");
   assert.equal(requests, 1, "no network from context or unchanged turns");
   assert.equal(h.handlers.has("session_before_compact"), false, "normal manual/threshold/overflow compaction stays authoritative");
+});
+
+test("branch-local reset releases masks append-only and keeps original evidence", async () => {
+  const h = harness();
+  const messages = h.sm.buildSessionContext().messages;
+  const wanted = candidates(messages, new Set(), 2_000)[0]!;
+  await h.fire("turn_end");
+  const maskedLeaf = h.sm.getLeafId()!;
+  const entriesBefore = h.sm.getBranch().length;
+  assert.equal(ledger(h.sm.getBranch()).size, 2);
+
+  await h.commands.get("jev-reset")!.handler("", h.ctx);
+  const resetLeaf = h.sm.getLeafId()!;
+  assert.equal(h.sm.getBranch().length, entriesBefore + 1);
+  assert.deepEqual((h.sm.getBranch().at(-1) as any).data, { version: 1, refs: [], reset: true });
+  assert.equal(ledger(h.sm.getBranch()).size, 0);
+  assert.equal(original(h.sm.getBranch(), wanted.ref), wanted.result);
+  assert.deepEqual((await h.fire("context", { messages })).messages, messages);
+  assert.doesNotMatch(h.statuses.at(-1)!, /cleared/);
+
+  h.sm.branch(maskedLeaf); await h.fire("session_tree");
+  assert.equal(ledger(h.sm.getBranch()).size, 2, "a sibling before reset keeps its branch masks");
+  h.sm.branch(resetLeaf); await h.fire("session_tree");
+  assert.equal(ledger(h.sm.getBranch()).size, 0);
+  h.sm.appendCustomEntry(ENTRY_TYPE, { version: 1, refs: [wanted.ref] });
+  assert.deepEqual([...ledger(h.sm.getBranch())], [wanted.ref], "legacy v1 additions still work after a reset");
 });
 
 test("pressure, missing key, disabled retrieval, null usage and all-keep cooldown", async () => {
@@ -219,16 +349,46 @@ test("failed real SessionManager persistence cannot activate masks, even after r
   const file = h.sm.getSessionFile()!;
   const saved = readFileSync(file);
   const messages = h.sm.buildSessionContext().messages;
+  const target = candidates(messages, new Set(), 2_000)[0]!;
+  const leaf = h.sm.getLeafId();
   rmSync(file); mkdirSync(file); // Real EISDIR after Pi has already inserted the entry in memory.
   await h.fire("turn_end");
   assert.equal(h.notices.length, 1);
+  assert.equal(h.sm.getLeafId(), leaf);
   assert.equal(ledger(h.sm.getBranch()).size, 0);
   assert.deepEqual((await h.fire("context", { messages })).messages, messages);
   h.handlers.clear(); registerJev(h.pi, { config, fetch: fakeFetch() });
   await h.fire("session_start");
   assert.deepEqual((await h.fire("context", { messages })).messages, messages);
   rmSync(file, { recursive: true }); writeFileSync(file, saved);
-  assert.equal(ledger(SessionManager.open(file, dir).getBranch()).size, 0);
+  h.sm.appendMessage({ role: "user", content: "Continue after recovered disk", timestamp: 9 });
+  const reopened = SessionManager.open(file, dir);
+  assert.equal(ledger(reopened.getBranch()).size, 0);
+  assert.deepEqual(original(reopened.getBranch(), target.ref), target.result);
+  assert.equal((reopened.getBranch().at(-1) as any).message.content, "Continue after recovered disk");
+});
+
+test("failed real reset persistence restores the branch head for later writes", async t => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-jev-reset-persistence-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const h = harness(fakeFetch(), config, SessionManager.create(dir, dir));
+  const target = candidates(h.sm.buildSessionContext().messages, new Set(), 2_000)[0]!;
+  await h.fire("turn_end");
+  const maskedLeaf = h.sm.getLeafId()!;
+  const file = h.sm.getSessionFile()!;
+  const saved = readFileSync(file);
+
+  rmSync(file); mkdirSync(file);
+  await h.commands.get("jev-reset")!.handler("", h.ctx);
+  assert.equal(h.sm.getLeafId(), maskedLeaf);
+  assert.equal(ledger(h.sm.getBranch()).size, 2);
+
+  rmSync(file, { recursive: true }); writeFileSync(file, saved);
+  h.sm.appendMessage({ role: "user", content: "Continue with masks", timestamp: 10 });
+  const reopened = SessionManager.open(file, dir);
+  assert.equal(ledger(reopened.getBranch()).size, 2);
+  assert.deepEqual(original(reopened.getBranch(), target.ref), target.result);
+  assert.equal((reopened.getBranch().at(-1) as any).message.content, "Continue with masks");
 });
 
 test("failures and failed persistence commit no new pruning", async () => {
@@ -241,6 +401,14 @@ test("failures and failed persistence commit no new pruning", async () => {
   persist.pi.appendEntry = () => { throw new Error("disk unavailable"); };
   await persist.fire("turn_end");
   assert.equal(ledger(persist.sm.getBranch()).size, 0);
+  const release = harness();
+  await release.fire("turn_end");
+  release.pi.appendEntry = (type: string, data: unknown) => {
+    release.sm.appendCustomEntry(type, data);
+    throw new Error("disk unavailable");
+  };
+  await release.commands.get("jev-reset")!.handler("", release.ctx);
+  assert.equal(ledger(release.sm.getBranch()).size, 2, "a failed reset cannot release persisted masks");
 });
 
 test("restart and branch navigation recover only branch-local masks and evidence", async () => {
@@ -269,7 +437,7 @@ test("late Jev results after a tree change cannot append decisions", async () =>
   const h = harness((async (_url, init) => {
     await new Promise<void>(resolve => { finish = resolve; });
     const request = JSON.parse(String(init!.body));
-    return Response.json({ answers: Object.fromEntries(Object.keys(request.questions).map(key => [key, { noul: 0 }])) });
+    return Response.json(response(request, 0));
   }) as typeof fetch);
   const pending = h.fire("turn_end");
   await h.fire("session_tree"); finish(); await pending;
@@ -280,7 +448,13 @@ test("configuration is bounded and ledger rejects unknown versions and malformed
   const parsed = configuration({ PI_JEV_THRESHOLD: "999", PI_JEV_TIMEOUT_MS: "-1", PI_JEV_KEEP_THRESHOLD: "NaN" });
   assert.equal(parsed.threshold, 0.65); assert.equal(parsed.timeoutMs, 5_000); assert.equal(parsed.keepThreshold, 0.25);
   const h = harness();
-  h.sm.appendCustomEntry(ENTRY_TYPE, { version: 2, refs: ["a".repeat(24)] });
+  const first = "a".repeat(24), second = "b".repeat(24);
+  h.sm.appendCustomEntry(ENTRY_TYPE, { version: 2, refs: [first] });
   h.sm.appendCustomEntry(ENTRY_TYPE, { version: 1, refs: ["invalid", 4] });
-  assert.equal(ledger(h.sm.getBranch()).size, 0);
+  h.sm.appendCustomEntry(ENTRY_TYPE, { version: 1, refs: [first] });
+  h.sm.appendCustomEntry(ENTRY_TYPE, { version: 1, refs: [second], reset: true });
+  assert.deepEqual([...ledger(h.sm.getBranch())], [first]);
+  h.sm.appendCustomEntry(ENTRY_TYPE, { version: 1, refs: [], reset: true });
+  h.sm.appendCustomEntry(ENTRY_TYPE, { version: 1, refs: [second] });
+  assert.deepEqual([...ledger(h.sm.getBranch())], [second]);
 });
