@@ -61,13 +61,13 @@ function editorWithStatus(
   });
 }
 
-function clearedTokens(branch: readonly SessionEntry[]): number {
+function cumulativeClearedTokens(entries: readonly SessionEntry[]): number {
   let total = 0;
-  for (const entry of branch) {
+  for (const entry of entries) {
     if (entry.type !== "custom" || entry.customType !== ENTRY_TYPE) continue;
-    const data = entry.data as { version?: unknown; refs?: unknown; reset?: unknown; estimatedTokensCleared?: unknown } | undefined;
-    if (data?.version !== 1) continue;
-    if (data.reset === true && Array.isArray(data.refs) && data.refs.length === 0) { total = 0; continue; }
+    const data = entry.data as { version?: unknown; refs?: unknown; estimatedTokensCleared?: unknown } | undefined;
+    if (data?.version !== 1 || !Array.isArray(data.refs) || !data.refs.length
+      || !data.refs.every(ref => typeof ref === "string" && /^[a-f0-9]{24}$/.test(ref))) continue;
     if (typeof data.estimatedTokensCleared === "number"
       && Number.isFinite(data.estimatedTokensCleared) && data.estimatedTokensCleared > 0) total += data.estimatedTokensCleared;
   }
@@ -94,7 +94,7 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
   let epoch = 0;
   let lastStatus = "No evaluation yet";
   let warned = false;
-  let barLabel = config.apiKey ? "Jev ready" : "Jev dormant";
+  let barLabel = `${config.apiKey ? "Jev ready" : "Jev dormant"} · 0 saved`;
   let editorTui: { requestRender(): void } | undefined;
   let editorInstalled = false;
 
@@ -115,23 +115,24 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
   };
 
   const updateStatus = (ctx: ExtensionContext) => {
-    const saved = clearedTokens(ctx.sessionManager.getBranch());
+    const saved = cumulativeClearedTokens(ctx.sessionManager.getEntries());
+    const savings = `${saved ? `~${compactTokens(saved)}` : "0"} saved`;
     const active = pi.getActiveTools().includes("jev_read");
-    barLabel = !config.apiKey ? "Jev dormant"
+    const state = !config.apiKey ? "Jev dormant"
       : !active ? "Jev paused"
       : controller ? "Jev checking…"
       : warned ? "Jev error"
-      : saved ? `Jev ~${compactTokens(saved)}`
       : "Jev ready";
+    barLabel = `${state} · ${savings}`;
     if (editorInstalled && ctx.mode === "tui") { editorTui?.requestRender(); return; }
     if (!ctx.hasUI) return;
-    if (!config.apiKey) { ctx.ui.setStatus("pi-jev", "Jev: dormant"); return; }
-    if (!active) { ctx.ui.setStatus("pi-jev", "Jev: paused · jev_read inactive"); return; }
+    if (!config.apiKey) { ctx.ui.setStatus("pi-jev", `Jev: dormant · ${savings}`); return; }
+    if (!active) { ctx.ui.setStatus("pi-jev", `Jev: paused · ${savings} · jev_read inactive`); return; }
     const usage = ctx.getContextUsage();
     const pressure = usage?.tokens !== null && usage?.tokens !== undefined && ctx.model?.contextWindow
       ? `${(usage.tokens / ctx.model.contextWindow * 100).toFixed(1)}%`
       : "waiting";
-    ctx.ui.setStatus("pi-jev", `Jev: ${pressure}${saved ? ` · ~${compactTokens(saved)} cleared` : ""}`);
+    ctx.ui.setStatus("pi-jev", `Jev: ${controller ? "checking…" : warned ? "error" : pressure} · ${savings}`);
   };
 
   const globals = globalThis as Record<PropertyKey, unknown>;
@@ -306,10 +307,12 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
   pi.registerCommand("jev-status", {
     description: "Show automatic Jev context-clearing status",
     handler: async (_args, ctx) => {
+      const saved = cumulativeClearedTokens(ctx.sessionManager.getEntries());
       ctx.ui.notify([
         config.apiKey ? `Automatic at ${Math.round(config.threshold * 100)}% context · ${config.model}` : "Dormant: TYPESAFE_API_KEY is missing",
         pi.getActiveTools().includes("jev_read") ? "Retrieval active" : "Paused: jev_read is inactive",
         `${ledger(ctx.sessionManager.getBranch()).size} cleared outputs on this branch`,
+        `Cumulative estimated context saved: ${saved ? `~${compactTokens(saved)}` : "0"} tokens`,
         lastStatus,
       ].join("\n"), "info");
     },

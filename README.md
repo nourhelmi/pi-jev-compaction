@@ -16,7 +16,7 @@ pi
 
 Get a key from [TypeSafe](https://typesafe.ai). Set it in the environment where you launch Pi. Already running Pi? `/reload` reloads the extension, but a newly exported shell variable requires restarting Pi from that shell.
 
-That's it. Clearing runs automatically. Interactive Pi shows `Jev ready`, `Jev checking…`, `Jev paused`, or estimated cleared tokens such as `Jev ~18k` in the input editor's bottom border; `/jev-status` shows the full configuration and last result.
+That's it. Clearing runs automatically. Interactive Pi always shows state plus cumulative estimated context saved, such as `Jev ready · 0 saved`, `Jev checking… · ~18k saved`, or `Jev paused · ~18k saved`, in the input editor's bottom border; `/jev-status` shows the full configuration and last result.
 
 ```sh
 pi remove git:github.com/nourhelmi/pi-jev-compaction
@@ -58,7 +58,7 @@ This is **context clearing before summarization**, not a promise of unlimited co
 
 Pi's normal manual, threshold and overflow compaction remain unchanged. Missing key? The extension is dormant. API error, timeout or invalid answer? No new outputs are cleared. Evaluation never delays the next provider request: a result applies to the next request available after it finishes, so a fast tool loop may carry the old output for one more cycle. Nothing can alter a provider request already in flight. Results are discarded if the branch changes, a new user task starts, or compaction begins; a large tool batch can still trigger ordinary compaction first.
 
-Evaluations are spaced by at least **8k estimated tokens of raw-context growth**. Stable decisions are reapplied locally without another API call. Changing old output invalidates the cached prompt prefix from that point onward; fewer context tokens do not automatically mean a cheaper session.
+Evaluations are spaced by at least **8k estimated tokens of raw-context growth**. Stable decisions are reapplied locally without another API call. The saved counter sums the estimated token footprints of successfully persisted clearing decisions across the entire session tree, so branch navigation, compaction, and `/jev-reset` do not erase it. It does not multiply savings across later requests or claim billing/cache savings. Changing old output invalidates the cached prompt prefix from that point onward; fewer context tokens do not automatically mean a cheaper session.
 
 **Use one history-rewriting extension at a time.** Disable competing compaction/provider-payload extensions, including Pi Meta Harness's `codex-compaction`, before using this as their replacement. Start a fresh session when switching away from provider-native encrypted checkpoints; this extension does not decode or migrate them. It never disables other extensions behind your back.
 

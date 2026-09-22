@@ -267,7 +267,7 @@ test("automatic hook flow persists only masks and retrieval returns exact paged 
   const originalEntries = structuredClone(h.sm.getBranch());
   const wanted = candidates(messages, new Set(), 2_000)[0]!;
   await h.fire("turn_end");
-  assert.match(h.statuses.at(-1)!, /^Jev: 70\.0% · ~[\d.]+k cleared$/);
+  assert.match(h.statuses.at(-1)!, /^Jev: 70\.0% · ~[\d.]+k saved$/);
   assert.equal(requests, 1);
   assert.deepEqual(h.sm.getBranch().slice(0, originalEntries.length), originalEntries);
   assert.equal(ledger(h.sm.getBranch()).size, 2);
@@ -281,6 +281,8 @@ test("automatic hook flow persists only masks and retrieval returns exact paged 
   await assert.rejects(tool.execute("retrieve", { ref: "0".repeat(24) }, undefined, undefined, h.ctx), /not on this session branch/);
   await h.fire("context", { messages }); await h.fire("turn_end");
   assert.equal(requests, 1, "no network from context or unchanged turns");
+  await h.commands.get("jev-status")!.handler("", h.ctx);
+  assert.match(h.notices.at(-1)!, /Cumulative estimated context saved: ~[\d.]+k tokens/);
   assert.equal(h.handlers.has("session_before_compact"), true, "background scoring is cancelled before normal compaction mutates the branch");
 });
 
@@ -292,6 +294,7 @@ test("branch-local reset releases masks append-only and keeps original evidence"
   const maskedLeaf = h.sm.getLeafId()!;
   const entriesBefore = h.sm.getBranch().length;
   assert.equal(ledger(h.sm.getBranch()).size, 2);
+  const cumulativeSaved = /~[\d.]+k saved$/.exec(h.statuses.at(-1)!)![0];
 
   await h.commands.get("jev-reset")!.handler("", h.ctx);
   const resetLeaf = h.sm.getLeafId()!;
@@ -300,10 +303,11 @@ test("branch-local reset releases masks append-only and keeps original evidence"
   assert.equal(ledger(h.sm.getBranch()).size, 0);
   assert.equal(original(h.sm.getBranch(), wanted.ref), wanted.result);
   assert.deepEqual((await h.fire("context", { messages })).messages, messages);
-  assert.doesNotMatch(h.statuses.at(-1)!, /cleared/);
+  assert.ok(h.statuses.at(-1)!.endsWith(cumulativeSaved), "reset releases masks without erasing cumulative savings");
 
   h.sm.branch(maskedLeaf); await h.fire("session_tree");
   assert.equal(ledger(h.sm.getBranch()).size, 2, "a sibling before reset keeps its branch masks");
+  assert.ok(h.statuses.at(-1)!.endsWith(cumulativeSaved), "cumulative session savings survive branch navigation");
   h.sm.branch(resetLeaf); await h.fire("session_tree");
   assert.equal(ledger(h.sm.getBranch()).size, 0);
   h.sm.appendCustomEntry(ENTRY_TYPE, { version: 1, refs: [wanted.ref] });
@@ -316,12 +320,12 @@ test("pressure, missing key, disabled retrieval, null usage and all-keep cooldow
   h.pressure(10_000); await h.fire("turn_end"); assert.equal(calls, 0);
   h.pressure(null); await h.fire("turn_end"); assert.equal(calls, 0);
   h.pressure(70_000); h.active([]); await h.fire("turn_end"); assert.equal(calls, 0);
-  assert.equal(h.statuses.at(-1), "Jev: paused · jev_read inactive");
+  assert.equal(h.statuses.at(-1), "Jev: paused · 0 saved · jev_read inactive");
   h.active(["jev_read"]); await h.fire("turn_end"); await h.fire("turn_end"); assert.equal(calls, 1);
   assert.equal(ledger(h.sm.getBranch()).size, 0);
   const missing = harness(fakeFetch(0, () => calls++), { ...config, apiKey: "" });
   await missing.fire("session_start"); await missing.fire("turn_end");
-  assert.equal(missing.statuses.at(-1), "Jev: dormant");
+  assert.equal(missing.statuses.at(-1), "Jev: dormant · 0 saved");
   assert.equal(await missing.fire("context", { messages: transcript() }), undefined);
   assert.equal(calls, 1);
 });
@@ -432,6 +436,7 @@ test("failures and failed persistence commit no new pruning", async () => {
   persist.pi.appendEntry = () => { throw new Error("disk unavailable"); };
   await persist.fire("turn_end");
   assert.equal(ledger(persist.sm.getBranch()).size, 0);
+  assert.match(persist.statuses.at(-1)!, /0 saved/, "failed persistence is not counted as savings");
   const release = harness();
   await release.fire("turn_end");
   release.pi.appendEntry = (type: string, data: unknown) => {
@@ -450,7 +455,8 @@ test("restart and branch navigation recover only branch-local masks and evidence
   const prunedLeaf = h.sm.getLeafId()!;
   await h.fire("session_start");
   assert.equal(ledger(h.sm.getBranch()).size, 2);
-  assert.match(h.statuses.at(-1)!, /cleared$/);
+  assert.match(h.statuses.at(-1)!, /saved$/);
+  const cumulativeSaved = /~[\d.]+k saved$/.exec(h.statuses.at(-1)!)![0];
   assert.equal(original(h.sm.getBranch(), target.ref), target.result);
   h.sm.branch(forkPoint); await h.fire("session_tree");
   assert.equal(ledger(h.sm.getBranch()).size, 0);
@@ -461,6 +467,7 @@ test("restart and branch navigation recover only branch-local masks and evidence
   assert.equal(original(h.sm.getBranch(), siblingRef), undefined);
   await h.fire("session_compact");
   assert.equal(ledger(h.sm.getBranch()).size, 2, "old entries remain available for retained-tail masks and evidence");
+  assert.ok(h.statuses.at(-1)!.endsWith(cumulativeSaved), "compaction does not erase cumulative savings");
 });
 
 test("late Jev results after a tree change cannot append decisions", async () => {
