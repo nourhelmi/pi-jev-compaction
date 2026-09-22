@@ -26,7 +26,7 @@ Requires Node.js **22.19+**. Tested against Pi **0.85.1**. Works with models run
 
 ## How it works
 
-1. At live model/tool boundaries, once usage reaches **65% of the model's context window**, launch an evaluation concurrently with the next model request.
+1. At live model/tool boundaries, once usage reaches **45% of the model's context window**, launch an evaluation concurrently with the next model request.
 2. Protect the latest **12k estimated tokens**, including complete parallel tool batches.
 3. Ask Jev about up to **16 large outputs**, sending bounded conversation, argument, and result excerpts in one request.
 4. Clear an output only when its estimated probability of still being needed is below **0.25**.
@@ -72,7 +72,7 @@ Environment variables are read when the extension loads. Invalid numeric setting
 | --- | --- | --- |
 | `TYPESAFE_API_KEY` | — | Required to enable automatic clearing |
 | `PI_JEV_MODEL` | `jev-1.13.0` | Jev model identifier |
-| `PI_JEV_THRESHOLD` | `0.65` | Context fraction that triggers evaluation; `0.1`–`0.95` |
+| `PI_JEV_THRESHOLD` | `0.45` | Context fraction that triggers evaluation; `0.1`–`0.95` |
 | `PI_JEV_KEEP_THRESHOLD` | `0.25` | Keep probabilities at or above this; lower is less aggressive |
 | `PI_JEV_KEEP_RECENT_TOKENS` | `12000` | Protected recent token window; `2000`–`100000` |
 | `PI_JEV_TIMEOUT_MS` | `5000` | Request deadline; `100`–`60000` |

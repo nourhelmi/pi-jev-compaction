@@ -26,7 +26,7 @@ export function configuration(env: NodeJS.ProcessEnv = process.env): Config {
   return {
     apiKey: env.TYPESAFE_API_KEY?.trim() ?? "",
     model: env.PI_JEV_MODEL?.trim() || "jev-1.13.0",
-    threshold: number(env.PI_JEV_THRESHOLD, 0.65, 0.1, 0.95),
+    threshold: number(env.PI_JEV_THRESHOLD, 0.45, 0.1, 0.95),
     keepThreshold: number(env.PI_JEV_KEEP_THRESHOLD, 0.25, 0, 1),
     keepRecentTokens: number(env.PI_JEV_KEEP_RECENT_TOKENS, 12_000, 2_000, 100_000),
     timeoutMs: number(env.PI_JEV_TIMEOUT_MS, 5_000, 100, 60_000),

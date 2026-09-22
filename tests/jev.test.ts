@@ -317,9 +317,9 @@ test("branch-local reset releases masks append-only and keeps original evidence"
 test("pressure, missing key, disabled retrieval, null usage and all-keep cooldown", async () => {
   let calls = 0;
   const h = harness(fakeFetch(1, () => calls++));
-  h.pressure(10_000); await h.fire("turn_end"); assert.equal(calls, 0);
+  h.pressure(44_999); await h.fire("turn_end"); assert.equal(calls, 0);
   h.pressure(null); await h.fire("turn_end"); assert.equal(calls, 0);
-  h.pressure(70_000); h.active([]); await h.fire("turn_end"); assert.equal(calls, 0);
+  h.pressure(47_600); h.active([]); await h.fire("turn_end"); assert.equal(calls, 0);
   assert.equal(h.statuses.at(-1), "Jev: paused · 0 saved · jev_read inactive");
   h.active(["jev_read"]); await h.fire("turn_end"); await h.fire("turn_end"); assert.equal(calls, 1);
   assert.equal(ledger(h.sm.getBranch()).size, 0);
@@ -513,7 +513,7 @@ test("late Jev results cannot cross a user-task or compaction boundary", async (
 
 test("configuration is bounded and ledger rejects unknown versions and malformed references", () => {
   const parsed = configuration({ PI_JEV_THRESHOLD: "999", PI_JEV_TIMEOUT_MS: "-1", PI_JEV_KEEP_THRESHOLD: "NaN" });
-  assert.equal(parsed.threshold, 0.65); assert.equal(parsed.timeoutMs, 5_000); assert.equal(parsed.keepThreshold, 0.25);
+  assert.equal(parsed.threshold, 0.45); assert.equal(parsed.timeoutMs, 5_000); assert.equal(parsed.keepThreshold, 0.25);
   const h = harness();
   const first = "a".repeat(24), second = "b".repeat(24);
   h.sm.appendCustomEntry(ENTRY_TYPE, { version: 2, refs: [first] });
