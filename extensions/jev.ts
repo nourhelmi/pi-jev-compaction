@@ -4,7 +4,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import {
   applyPruning, candidates, configuration, ENTRY_TYPE, GROWTH_TOKENS,
-  ledger, original, score, textOf, type Config,
+  ledger, original, score, superseded, textOf, type Config,
 } from "../src/pruning.ts";
 
 const EDITOR_COMPONENT_CHANGED_EVENT = "ui-pack:v1:editor-component-changed";
@@ -12,6 +12,12 @@ const JEV_EDITOR_FACTORY = "__piJevEditorFactory";
 const JEV_EDITOR_LISTENER = Symbol.for("pi-jev.editorChangedListener");
 const ANSI = /\x1b\[[0-?]*[ -/]*[@-~]/g;
 
+function nativeCheckpoint(branch: readonly SessionEntry[]): boolean {
+  const latest = branch.findLast(entry => entry.type === "compaction"
+    || (entry.type === "custom" && entry.customType === "openai-codex-native-compaction"));
+  return latest?.type === "custom" || (latest?.type === "compaction"
+    && (latest.details as { kind?: unknown } | undefined)?.kind === "openai-codex-native-compaction");
+}
 type EditorFactory = NonNullable<ReturnType<ExtensionContext["ui"]["getEditorComponent"]>>;
 type EditorInstance = ReturnType<EditorFactory>;
 interface MarkedEditorFactory extends Function { __piJevEditorFactory?: true; }
@@ -119,7 +125,7 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
     const savings = `${saved ? `~${compactTokens(saved)}` : "0"} saved`;
     const active = pi.getActiveTools().includes("jev_read");
     const state = !config.apiKey ? "Jev dormant"
-      : !active ? "Jev paused"
+      : !active || nativeCheckpoint(ctx.sessionManager.getBranch()) ? "Jev paused"
       : controller ? "Jev checking…"
       : warned ? "Jev error"
       : "Jev ready";
@@ -128,6 +134,10 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
     if (!ctx.hasUI) return;
     if (!config.apiKey) { ctx.ui.setStatus("pi-jev", `Jev: dormant · ${savings}`); return; }
     if (!active) { ctx.ui.setStatus("pi-jev", `Jev: paused · ${savings} · jev_read inactive`); return; }
+    if (nativeCheckpoint(ctx.sessionManager.getBranch())) {
+      ctx.ui.setStatus("pi-jev", `Jev: paused · ${savings} · Codex checkpoint owns provider context`);
+      return;
+    }
     const usage = ctx.getContextUsage();
     const pressure = usage?.tokens !== null && usage?.tokens !== undefined && ctx.model?.contextWindow
       ? `${(usage.tokens / ctx.model.contextWindow * 100).toFixed(1)}%`
@@ -172,6 +182,7 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
   const startEvaluation = (ctx: ExtensionContext): void => {
     if (!config.apiKey || controller || !ctx.model || !pi.getActiveTools().includes("jev_read")) return;
     const branch = ctx.sessionManager.getBranch();
+    if (nativeCheckpoint(branch)) return;
     const messages = buildSessionContext(branch).messages;
     const rawTokens = messages.reduce((sum, message) => sum + estimateTokens(message), 0);
     const usageTokens = ctx.getContextUsage()?.tokens ?? 0;
@@ -181,6 +192,8 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
     const refs = ledger(branch);
     const choices = candidates(messages, refs, config.keepRecentTokens);
     if (!choices.length) { lastStatus = "No old eligible outputs"; return; }
+    const automatic = superseded(messages, choices, refs);
+    const uncertain = choices.filter(item => !automatic.has(item.ref));
 
     const ownController = new AbortController();
     controller = ownController;
@@ -190,7 +203,9 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
 
     void (async () => {
       try {
-        const result = await score(applyPruning(messages, refs), choices, config, ownController.signal, options.fetch);
+        const result = uncertain.length
+          ? await score(applyPruning(messages, refs), uncertain, config, ownController.signal, options.fetch)
+          : { refs: [] as string[], evaluated: 0, inputTokens: null };
         if (ownController.signal.aborted || epoch !== ownEpoch || !pi.getActiveTools().includes("jev_read")) return;
         const currentBranch = ctx.sessionManager.getBranch();
         const snapshotIndex = snapshotLeaf ? currentBranch.findIndex(entry => entry.id === snapshotLeaf) : -1;
@@ -202,13 +217,14 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
         const currentRefs = ledger(currentBranch);
         const currentMessages = buildSessionContext(currentBranch).messages;
         const eligible = new Set(candidates(currentMessages, currentRefs, config.keepRecentTokens).map(item => item.ref));
-        const cleared = choices.filter(item => result.refs.includes(item.ref) && eligible.has(item.ref));
+        const cleared = choices.filter(item => eligible.has(item.ref)
+          && (result.refs.includes(item.ref) || (automatic.has(item.ref) && superseded(currentMessages, [item], currentRefs).has(item.ref))));
         const clearedRefs = new Set(cleared.map(item => item.ref));
         const saved = cleared.reduce((sum, item) => sum + estimateTokens(item.result)
           - estimateTokens(applyPruning([item.result], clearedRefs)[0]!), 0);
         if (cleared.length) {
           const entry = {
-            version: 1, refs: [...clearedRefs], model: config.model, evaluated: result.evaluated,
+            version: 1, refs: [...clearedRefs], model: config.model, evaluated: choices.length,
             estimatedTokensCleared: saved, inputTokens: result.inputTokens,
           };
           const commitLeaf = ctx.sessionManager.getLeafId();
@@ -221,7 +237,7 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
             throw error;
           }
         }
-        lastStatus = `${cleared.length}/${result.evaluated} outputs cleared; ~${saved.toLocaleString()} context tokens removed`;
+        lastStatus = `${cleared.length}/${choices.length} outputs cleared; ~${saved.toLocaleString()} context tokens removed`;
         warned = false;
       } catch (error) {
         if (epoch !== ownEpoch || ownController.signal.aborted) return;
@@ -238,7 +254,7 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
   pi.on("context", (event, ctx) => {
     if (!config.apiKey) return;
     updateStatus(ctx);
-    if (!pi.getActiveTools().includes("jev_read")) return;
+    if (!pi.getActiveTools().includes("jev_read") || nativeCheckpoint(ctx.sessionManager.getBranch())) return;
     const projected = applyPruning(event.messages, ledger(ctx.sessionManager.getBranch()));
     startEvaluation(ctx);
     return { messages: projected };

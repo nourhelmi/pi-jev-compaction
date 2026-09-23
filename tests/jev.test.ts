@@ -8,7 +8,7 @@ import { SessionManager, type ExtensionAPI, type ExtensionContext, type ToolDefi
 import { injectJevEditorStatus, registerJev } from "../extensions/jev.ts";
 import {
   applyPruning, candidates, configuration, ENTRY_TYPE, ledger, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
-  original, reference, requestBody, score, textOf, type Config, type ToolResult,
+  original, reference, requestBody, score, superseded, textOf, type Config, type ToolResult,
 } from "../src/pruning.ts";
 
 const config: Config = { ...configuration({}), apiKey: "test-key", keepRecentTokens: 2_000 };
@@ -127,6 +127,73 @@ test("candidate selection protects recent batches, errors, skills, images, tool 
   (batch[0] as Extract<AgentMessage, { role: "assistant" }>).content.push({ type: "toolCall", id: "two", name: "read", arguments: {} });
   const last = pair("two")[1] as ToolResult; last.content = [{ type: "text", text: "x".repeat(20_000) }];
   assert.deepEqual(candidates([...batch, last], new Set(), 2_000), [], "protect the whole latest parallel batch");
+});
+
+test("only complete same-file rereads and identical successful test reruns supersede old output", () => {
+  const oldRead = pair("read-old", "read", { path: "src/parser.ts" });
+  const newRead = pair("read-new", "read", { path: "src/parser.ts" });
+  (newRead[1] as ToolResult).details = { snapshotId: "new", metrics: { truncated: false } };
+  const oldTest = pair("test-old", "bg_run", { command: "npm test", cwd: "/repo" });
+  const newTest = pair("test-new", "bg_run", { command: "npm test", cwd: "/repo" });
+  for (const item of [oldTest[1], newTest[1]] as ToolResult[]) item.details = { status: "exited", exitCode: 0, promoted: false };
+  const tail: StoredMessage = { role: "user", content: "current ".repeat(1_500), timestamp: 3 };
+  const messages = [...oldRead, ...oldTest, ...newRead, ...newTest, tail];
+  const selected = candidates(messages, new Set(), 2_000);
+  assert.deepEqual(superseded(messages, selected), new Set([reference(oldRead[1] as ToolResult), reference(oldTest[1] as ToolResult)]));
+  assert.deepEqual(superseded(messages, selected, new Set([reference(newRead[1] as ToolResult), reference(newTest[1] as ToolResult)])), new Set());
+  (newRead[1] as ToolResult).details = { metrics: { truncated: true } };
+  (newTest[1] as ToolResult).details = { status: "running", promoted: true };
+  assert.deepEqual(superseded(messages, candidates(messages, new Set(), 2_000)), new Set());
+  (newRead[1] as ToolResult).details = { metrics: { truncated: false } };
+  (newTest[1] as ToolResult).details = { status: "exited", exitCode: 0, promoted: false };
+  (newRead[0] as Extract<AgentMessage, { role: "assistant" }>).content[2] = { type: "toolCall", id: "read-new", name: "read", arguments: { path: "src/parser.ts", limit: 30 } };
+  (newTest[0] as Extract<AgentMessage, { role: "assistant" }>).content[2] = { type: "toolCall", id: "test-new", name: "bg_run", arguments: { command: "npm test", cwd: "/other" } };
+  assert.deepEqual(superseded(messages, candidates(messages, new Set(), 2_000)), new Set());
+  assert.deepEqual(candidates([...pair("unsafe", "bg_run", { command: "npm test" }), tail], new Set(), 2_000), []);
+  assert.deepEqual(candidates([...pair("arbitrary", "bg_run", { command: "npm test && curl example.com" }), tail], new Set(), 2_000), []);
+});
+
+test("proven supersession wins the 16-candidate budget over larger unrelated outputs", () => {
+  const old = pair("earlier", "read", { path: "src/a.ts" });
+  const newer = pair("later", "read", { path: "src/a.ts" });
+  (newer[1] as ToolResult).details = { metrics: { truncated: false } };
+  const noise = Array.from({ length: 16 }, (_, i) => {
+    const messages = pair(`noise-${i}`, "bash", { command: `git show ${i}` });
+    (messages[1] as ToolResult).content = [{ type: "text", text: "diff\n".repeat(6_000) }];
+    return messages;
+  }).flat();
+  const messages = [...old, ...noise, ...newer, { role: "user" as const, content: "current ".repeat(1_500), timestamp: 3 }];
+  assert.ok(candidates(messages, new Set(), 2_000).some(item => item.ref === reference(old[1] as ToolResult)));
+});
+
+test("automatic supersession clears old reads while Jev keeps unique evidence", async () => {
+  let requested = 0;
+  const h = harness(fakeFetch(0.99, body => {
+    requested++;
+    assert.equal(body.state.results.length, 1, "only the unique output needs Jev scoring");
+  }));
+  const newer = pair("latest", "read", { path: "old.ts" });
+  (newer[1] as ToolResult).details = { metrics: { truncated: false } };
+  for (const message of newer) h.sm.appendMessage(message);
+  h.sm.appendMessage({ role: "user", content: "now ".repeat(1_500), timestamp: 9 });
+  await h.fire("turn_end");
+  assert.equal(requested, 1);
+  assert.equal(ledger(h.sm.getBranch()).size, 1);
+  assert.ok(ledger(h.sm.getBranch()).has(reference(transcript()[2] as ToolResult)));
+});
+
+test("Codex-native checkpoints take sole ownership of provider context without losing original retrieval", async () => {
+  let requested = 0;
+  const h = harness(fakeFetch(0.1, () => { requested++; }));
+  const old = reference(transcript()[2] as ToolResult);
+  h.sm.appendCustomEntry(ENTRY_TYPE, { version: 1, refs: [old] });
+  h.sm.appendCompaction("native checkpoint", h.sm.getBranch()[0]!.id, 100_000, { kind: "openai-codex-native-compaction" }, true);
+  const messages = [{ role: "toolResult", toolCallId: "old", toolName: "read", content: [{ type: "text", text: "x".repeat(3000) }], isError: false, timestamp: 2 }] as AgentMessage[];
+  assert.equal(await h.fire("context", { messages }), undefined);
+  await h.fire("turn_end");
+  assert.equal(requested, 0);
+  assert.equal(ledger(h.sm.getBranch()).size, 1);
+  assert.ok(h.statuses.some(status => status.includes("Codex checkpoint owns provider context")));
 });
 
 test("projection keeps message order, calls, signatures, metadata and originals; stable replay is idempotent", () => {

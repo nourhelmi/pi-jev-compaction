@@ -2,7 +2,7 @@
 
 **Keep the conversation. Clear stale tool output. Get the original back without running the command again.**
 
-An automatic [Pi](https://pi.dev) extension powered by [TypeSafe Jev](https://typesafe.ai). Jev scores older tool outputs; Pi stops sending the ones you no longer need. Your original session messages stay intact.
+An automatic [Pi](https://pi.dev) extension powered by [TypeSafe Jev](https://typesafe.ai). It clears safely superseded reads and test runs directly; Jev scores other older tool outputs. Original session messages stay intact.
 
 No extra agent. No summary model. No runtime dependencies beyond Pi.
 
@@ -22,14 +22,14 @@ That's it. Clearing runs automatically. Interactive Pi always shows state plus c
 pi remove git:github.com/nourhelmi/pi-jev-compaction
 ```
 
-Requires Node.js **22.19+**. Tested against Pi **0.85.1**. Works with models running inside Pi, not with standalone Claude Code or Codex CLI sessions.
+Requires Node.js **22.19+**. Tested against Pi **0.87.1**. Works with models running inside Pi, not with standalone Claude Code or Codex CLI sessions.
 
 ## How it works
 
 1. At live model/tool boundaries, once usage reaches **45% of the model's context window**, launch an evaluation concurrently with the next model request.
 2. Protect the latest **12k estimated tokens**, including complete parallel tool batches.
-3. Ask Jev about up to **16 large outputs**, sending bounded conversation, argument, and result excerpts in one request.
-4. Clear an output only when its estimated probability of still being needed is below **0.25**.
+3. Clear older reads after a later complete read of the same path, and successful test runs after a later successful run of the identical command in the same working directory. These checks don't need a network call.
+4. Ask Jev about up to **16 remaining large outputs**, sending bounded conversation, argument, and result excerpts in one request. Clear them only when their estimated probability of still being needed is below **0.25**.
 5. Replace its model-facing body with a stable marker. Keep the tool call, message order, metadata, and original evidence.
 
 Example marker:
@@ -48,7 +48,7 @@ Clearing decisions are small append-only session entries. Reloads and branches r
 - User and assistant text, tool calls, thinking/signatures, custom messages and summaries.
 - Recent tool batches, failed outputs, images and other non-text result blocks.
 - Skill/`AGENTS.md` reads, deferred-tool loading results, `jev_read` responses.
-- Known background-agent, advisor, memory, goal, task and coordination tool outputs.
+- Background-agent, advisor, memory, goal, task and coordination tool outputs. Completed, successful `bg_run` test commands are the only background exception.
 
 Only successful text outputs of at least **2,000 characters** are eligible. Unknown or ambiguous call/result pairing, credential-file access, and outputs containing obvious secret patterns are left alone. Jev sees excerpts, not complete evidence, and can make relevance mistakes; the retrieval tool exists for that reason.
 
@@ -60,7 +60,7 @@ Pi's normal manual, threshold and overflow compaction remain unchanged. Missing 
 
 Evaluations are spaced by at least **8k estimated tokens of raw-context growth**. Stable decisions are reapplied locally without another API call. The saved counter sums the estimated token footprints of successfully persisted clearing decisions across the entire session tree, so branch navigation, compaction, and `/jev-reset` do not erase it. It does not multiply savings across later requests or claim billing/cache savings. Changing old output invalidates the cached prompt prefix from that point onward; fewer context tokens do not automatically mean a cheaper session.
 
-**Use one history-rewriting extension at a time.** Disable competing compaction/provider-payload extensions, including Pi Meta Harness's `codex-compaction`, before using this as their replacement. Start a fresh session when switching away from provider-native encrypted checkpoints; this extension does not decode or migrate them. It never disables other extensions behind your back.
+Don't co-load another general-purpose context-pruning extension. Pi Meta Harness's `codex-compaction` may be used for provider-native OpenAI Codex compaction: JEV handles earlier output, then pauses on that branch while the native encrypted checkpoint owns provider context. It still preserves `jev_read` retrieval, but cannot rewrite or migrate the checkpoint. Other providers, including Claude, continue using Pi's normal summarization; the native checkpoint is Codex-only.
 
 Keep `jev_read` active. If your tool allowlist excludes it, the frame shows `Jev paused`, no new clearing decisions are made, and existing masks stop applying until retrieval is enabled again.
 
