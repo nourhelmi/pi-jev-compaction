@@ -326,7 +326,9 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
       const saved = cumulativeClearedTokens(ctx.sessionManager.getEntries());
       ctx.ui.notify([
         config.apiKey ? `Automatic at ${Math.round(config.threshold * 100)}% context · ${config.model}` : "Dormant: TYPESAFE_API_KEY is missing",
-        pi.getActiveTools().includes("jev_read") ? "Retrieval active" : "Paused: jev_read is inactive",
+        !pi.getActiveTools().includes("jev_read") ? "Paused: jev_read is inactive"
+          : nativeCheckpoint(ctx.sessionManager.getBranch()) ? "Paused: Codex checkpoint owns provider context; retrieval active"
+          : "Retrieval active",
         `${ledger(ctx.sessionManager.getBranch()).size} cleared outputs on this branch`,
         `Cumulative estimated context saved: ${saved ? `~${compactTokens(saved)}` : "0"} tokens`,
         lastStatus,

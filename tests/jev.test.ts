@@ -194,6 +194,8 @@ test("Codex-native checkpoints take sole ownership of provider context without l
   assert.equal(requested, 0);
   assert.equal(ledger(h.sm.getBranch()).size, 1);
   assert.ok(h.statuses.some(status => status.includes("Codex checkpoint owns provider context")));
+  await h.commands.get("jev-status")!.handler("", h.ctx);
+  assert.ok(h.notices.some(notice => notice.includes("Paused: Codex checkpoint owns provider context; retrieval active")));
 });
 
 test("projection keeps message order, calls, signatures, metadata and originals; stable replay is idempotent", () => {
