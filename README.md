@@ -26,11 +26,12 @@ Requires Node.js **22.19+**. Tested against Pi **0.87.1**. Works with models run
 
 ## How it works
 
-1. At live model/tool boundaries, once usage reaches **45% of the model's context window**, launch an evaluation concurrently with the next model request.
+1. At live model/tool boundaries, once the next request reaches **120k tokens or 45% of the model's context window, whichever is smaller**, launch an evaluation concurrently with the next model request. Cleared outputs no longer count, so a successful clearing is its own hysteresis. A 1M-token window starts at 120k instead of 450k.
 2. Protect the latest **12k estimated tokens**, including complete parallel tool batches.
-3. Clear older reads after a later complete read of the same path, and successful test runs after a later successful run of the identical command in the same working directory. These checks don't need a network call.
+3. Clear outputs that a later output restates, with no network call: a later complete read of the same path, a later successful run of the identical test command in the same working directory, a later advisor checkpoint read or write, a later plan for the same graph, a repeated skill read, a later `bg_list`, a later terminal `bg_output` for the same run, or identical diagnostics.
 4. Ask Jev about up to **16 remaining large outputs**, sending bounded conversation, argument, and result excerpts in one request. Clear them only when their estimated probability of still being needed is below **0.25**.
-5. Replace its model-facing body with a stable marker. Keep the tool call, message order, metadata, and original evidence.
+5. Commit the batch only when its one-time cache rewrite repays within **20 later requests**. Clearing an output invalidates the cached prompt from that output onward, so a small old output waits until a larger batch justifies the rewrite.
+6. Replace each cleared output's model-facing body with a stable marker. Keep the tool call, message order, metadata, and original evidence.
 
 Example marker:
 
@@ -47,8 +48,11 @@ Clearing decisions are small append-only session entries. Reloads and branches r
 
 - User and assistant text, tool calls, thinking/signatures, custom messages and summaries.
 - Recent tool batches, failed outputs, images and other non-text result blocks.
-- Skill/`AGENTS.md` reads, deferred-tool loading results, `jev_read` responses.
-- Background-agent, advisor, memory, goal, task and coordination tool outputs. Completed, successful `bg_run` test commands are the only background exception.
+- `AGENTS.md` and `SKILL.md` file reads, deferred-tool loading results, `jev_read` responses.
+- Launch receipts and coordination: `bg_agent`, `bg_stop`, `bg_watch`, `bg_await`, advisor session/launch/evidence tools, memory writes, goals, routines, teams, `agent_message`, `intercom` and `todo`.
+- The latest advisor checkpoint, graph plan, skill read and run list. These are cleared only when superseded and are never sent to Jev.
+
+Completed foreground `bg_run` output, `bg_output` tails and transcripts, and memory searches are ordinary evidence that Jev may score.
 
 Only successful text outputs of at least **2,000 characters** are eligible. Unknown or ambiguous call/result pairing, credential-file access, and outputs containing obvious secret patterns are left alone. Jev sees excerpts, not complete evidence, and can make relevance mistakes; the retrieval tool exists for that reason.
 
@@ -58,7 +62,7 @@ This is **context clearing before summarization**, not a promise of unlimited co
 
 Pi's normal manual, threshold and overflow compaction remain unchanged. Missing key? The extension is dormant. API error, timeout or invalid answer? No new outputs are cleared. Evaluation never delays the next provider request: a result applies to the next request available after it finishes, so a fast tool loop may carry the old output for one more cycle. Nothing can alter a provider request already in flight. Results are discarded if the branch changes, a new user task starts, or compaction begins; a large tool batch can still trigger ordinary compaction first.
 
-Evaluations are spaced by at least **8k estimated tokens of raw-context growth**. Stable decisions are reapplied locally without another API call. The saved counter sums the estimated token footprints of successfully persisted clearing decisions across the entire session tree, so branch navigation, compaction, and `/jev-reset` do not erase it. It does not multiply savings across later requests or claim billing/cache savings. Changing old output invalidates the cached prompt prefix from that point onward; fewer context tokens do not automatically mean a cheaper session.
+Evaluations are spaced by at least **8k estimated tokens of raw-context growth**. The payback gate models an Anthropic-style cache (writes 1.25×, reads 0.1× input): clearing saves reads on every later request but rewrites everything after the earliest cleared output once. The gate favors large, recent batches; `PI_JEV_MAX_PAYBACK_TURNS` tunes it. Stable decisions are reapplied locally without another API call. The saved counter sums the estimated token footprints of successfully persisted clearing decisions across the entire session tree, so branch navigation, compaction, and `/jev-reset` do not erase it. It does not multiply savings across later requests or claim billing/cache savings. Changing old output invalidates the cached prompt prefix from that point onward; fewer context tokens do not automatically mean a cheaper session.
 
 Don't co-load another general-purpose context-pruning extension. Pi Meta Harness's `codex-compaction` may be used for provider-native OpenAI Codex compaction: JEV handles earlier output, then pauses on that branch while the native encrypted checkpoint owns provider context. It still preserves `jev_read` retrieval, but cannot rewrite or migrate the checkpoint. Other providers, including Claude, continue using Pi's normal summarization; the native checkpoint is Codex-only.
 
@@ -73,6 +77,8 @@ Environment variables are read when the extension loads. Invalid numeric setting
 | `TYPESAFE_API_KEY` | — | Required to enable automatic clearing |
 | `PI_JEV_MODEL` | `jev-1.13.0` | Jev model identifier |
 | `PI_JEV_THRESHOLD` | `0.45` | Context fraction that triggers evaluation; `0.1`–`0.95` |
+| `PI_JEV_TRIGGER_TOKENS` | `120000` | Absolute trigger; the smaller of this and the fraction applies; `8000`–`2000000` |
+| `PI_JEV_MAX_PAYBACK_TURNS` | `20` | Commit a clearing batch only when its cache rewrite repays within this many requests; `1`–`1000` |
 | `PI_JEV_KEEP_THRESHOLD` | `0.25` | Keep probabilities at or above this; lower is less aggressive |
 | `PI_JEV_KEEP_RECENT_TOKENS` | `12000` | Protected recent token window; `2000`–`100000` |
 | `PI_JEV_TIMEOUT_MS` | `5000` | Request deadline; `100`–`60000` |

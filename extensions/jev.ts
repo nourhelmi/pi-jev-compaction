@@ -3,8 +3,8 @@ import {
   CustomEditor, buildSessionContext, estimateTokens, type ExtensionAPI, type ExtensionContext, type SessionEntry, type SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import {
-  applyPruning, candidates, configuration, ENTRY_TYPE, GROWTH_TOKENS,
-  ledger, original, score, superseded, textOf, type Config,
+  affordable, applyPruning, candidates, configuration, ENTRY_TYPE, GROWTH_TOKENS,
+  ledger, original, score, superseded, textOf, triggerTokens, type Config,
 } from "../src/pruning.ts";
 
 const EDITOR_COMPONENT_CHANGED_EVENT = "ui-pack:v1:editor-component-changed";
@@ -184,12 +184,14 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
     const branch = ctx.sessionManager.getBranch();
     if (nativeCheckpoint(branch)) return;
     const messages = buildSessionContext(branch).messages;
+    const refs = ledger(branch);
     const rawTokens = messages.reduce((sum, message) => sum + estimateTokens(message), 0);
+    // Measure what the next request carries: cleared outputs no longer count, so clearing is its own hysteresis.
+    const projectedTokens = applyPruning(messages, refs).reduce((sum, message) => sum + estimateTokens(message), 0);
     const usageTokens = ctx.getContextUsage()?.tokens ?? 0;
-    if (Math.max(rawTokens, usageTokens) / ctx.model.contextWindow < config.threshold) return;
+    if (Math.max(projectedTokens, usageTokens) < triggerTokens(config, ctx.model.contextWindow)) return;
     if (rawTokens >= lastAttemptTokens && rawTokens - lastAttemptTokens < GROWTH_TOKENS) return;
     lastAttemptTokens = rawTokens;
-    const refs = ledger(branch);
     const choices = candidates(messages, refs, config.keepRecentTokens);
     if (!choices.length) { lastStatus = "No old eligible outputs"; return; }
     const automatic = superseded(messages, choices, refs);
@@ -217,8 +219,10 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
         const currentRefs = ledger(currentBranch);
         const currentMessages = buildSessionContext(currentBranch).messages;
         const eligible = new Set(candidates(currentMessages, currentRefs, config.keepRecentTokens).map(item => item.ref));
-        const cleared = choices.filter(item => eligible.has(item.ref)
+        const accepted = choices.filter(item => eligible.has(item.ref)
           && (result.refs.includes(item.ref) || (automatic.has(item.ref) && superseded(currentMessages, [item], currentRefs).has(item.ref))));
+        const cleared = affordable(currentMessages, currentRefs, accepted, config.maxPaybackTurns);
+        const deferred = accepted.length - cleared.length;
         const clearedRefs = new Set(cleared.map(item => item.ref));
         const saved = cleared.reduce((sum, item) => sum + estimateTokens(item.result)
           - estimateTokens(applyPruning([item.result], clearedRefs)[0]!), 0);
@@ -237,7 +241,8 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
             throw error;
           }
         }
-        lastStatus = `${cleared.length}/${choices.length} outputs cleared; ~${saved.toLocaleString()} context tokens removed`;
+        lastStatus = `${cleared.length}/${choices.length} outputs cleared; ~${saved.toLocaleString()} context tokens removed`
+          + (deferred ? `; ${deferred} deferred until a larger batch repays the cache rewrite` : "");
         warned = false;
       } catch (error) {
         if (epoch !== ownEpoch || ownController.signal.aborted) return;
@@ -325,7 +330,7 @@ export function registerJev(pi: ExtensionAPI, options: { config?: Config; fetch?
     handler: async (_args, ctx) => {
       const saved = cumulativeClearedTokens(ctx.sessionManager.getEntries());
       ctx.ui.notify([
-        config.apiKey ? `Automatic at ${Math.round(config.threshold * 100)}% context · ${config.model}` : "Dormant: TYPESAFE_API_KEY is missing",
+        config.apiKey ? `Automatic at ${compactTokens(ctx.model ? triggerTokens(config, ctx.model.contextWindow) : config.triggerTokens)} context tokens (lesser of ${Math.round(config.threshold * 100)}% and ${compactTokens(config.triggerTokens)}) · ${config.model}` : "Dormant: TYPESAFE_API_KEY is missing",
         !pi.getActiveTools().includes("jev_read") ? "Paused: jev_read is inactive"
           : nativeCheckpoint(ctx.sessionManager.getBranch()) ? "Paused: Codex checkpoint owns provider context; retrieval active"
           : "Retrieval active",

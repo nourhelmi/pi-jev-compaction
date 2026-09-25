@@ -12,8 +12,10 @@ export interface Config {
   apiKey: string;
   model: string;
   threshold: number;
+  triggerTokens: number;
   keepThreshold: number;
   keepRecentTokens: number;
+  maxPaybackTurns: number;
   timeoutMs: number;
 }
 
@@ -27,10 +29,17 @@ export function configuration(env: NodeJS.ProcessEnv = process.env): Config {
     apiKey: env.TYPESAFE_API_KEY?.trim() ?? "",
     model: env.PI_JEV_MODEL?.trim() || "jev-1.13.0",
     threshold: number(env.PI_JEV_THRESHOLD, 0.45, 0.1, 0.95),
+    triggerTokens: number(env.PI_JEV_TRIGGER_TOKENS, 120_000, 8_000, 2_000_000),
     keepThreshold: number(env.PI_JEV_KEEP_THRESHOLD, 0.25, 0, 1),
     keepRecentTokens: number(env.PI_JEV_KEEP_RECENT_TOKENS, 12_000, 2_000, 100_000),
+    maxPaybackTurns: number(env.PI_JEV_MAX_PAYBACK_TURNS, 20, 1, 1_000),
     timeoutMs: number(env.PI_JEV_TIMEOUT_MS, 5_000, 100, 60_000),
   };
+}
+
+/** Context size that starts evaluation: a fraction of small windows, an absolute budget for large ones. */
+export function triggerTokens(config: Config, contextWindow: number): number {
+  return Math.min(config.threshold * contextWindow, config.triggerTokens);
 }
 
 export function textOf(result: ToolResult): string {
@@ -75,7 +84,10 @@ export interface Candidate {
   input: Record<string, unknown>;
 }
 
-const PROTECTED_TOOLS = /^(?:bg_|advisor_|mem_|goal_|Routine|intercom$|todo$|read_skill$|jev_read$)/;
+/** Never cleared: launch receipts, coordination, identity, goals and memory writes stay verbatim. */
+const PROTECTED_TOOLS = /^(?:bg_(?:agent|stop|watch|await)$|advisor_(?:session_init|launch|graph_evidence)$|mem_(?!search$|context$|timeline$|get_observation$)|goal_|Routine|intercom$|agent_message$|team_|todo$|jev_read$)/;
+/** Cleared only after a later output restates the same subject; never scored, so never uploaded. */
+const SUPERSEDE_ONLY_TOOLS: ReadonlySet<string> = new Set(["advisor_checkpoint", "advisor_graph_plan", "read_skill", "bg_list"]);
 const TEST_COMMAND = /^(?:(?:npm|pnpm|yarn|bun) (?:run )?(?:test|check|typecheck)|(?:python3? -m )?pytest|go test|cargo test)(?: --? [\w./=-]+)*$/;
 const SENSITIVE_PATH = /(?:^|[\\/\s"'=@])(?:\.env(?:\.[a-z0-9_.-]+)?|id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?|credentials(?:\.[a-z0-9_.-]+)?|auth\.json|\.npmrc|\.pypirc|\.netrc|(?:SKILL|AGENTS)\.md|[^\\/\s"'=]+\.(?:pem|key))(?=$|[\\/\s"',;)\]}])/i;
 const SENSITIVE_KEY = /(?:^|[_-])(?:api[_-]?key|secret[_-]?access[_-]?key|access[_-]?key|private[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|credentials?|secret|password|passwd|token)$/i;
@@ -117,11 +129,16 @@ function sensitiveInput(value: unknown, sensitive = false): boolean {
   return sensitive && value !== null;
 }
 
+/** A foreground `bg_run` that finished; promoted runs report through a separate completion message. */
+function completedRun(result: ToolResult): boolean {
+  const details = result.details;
+  return record(details) && details.status === "exited" && details.promoted === false;
+}
+
 function testRun(result: ToolResult, input: Record<string, unknown>): boolean {
   if (typeof input.command !== "string" || !TEST_COMMAND.test(input.command) || result.isError) return false;
   if (result.toolName !== "bg_run") return result.toolName === "bash";
-  const details = result.details;
-  return record(details) && details.status === "exited" && details.exitCode === 0 && details.promoted === false;
+  return completedRun(result) && record(result.details) && result.details.exitCode === 0;
 }
 
 function completeRead(result: ToolResult, input: Record<string, unknown>): boolean {
@@ -155,8 +172,7 @@ function pairedOutputs(
   const results: Array<Candidate & { index: number }> = [];
   for (let index = 0; index < boundary; index++) {
     const message = messages[index]!;
-    if (message.role !== "toolResult" || message.isError
-      || (PROTECTED_TOOLS.test(message.toolName) && message.toolName !== "bg_run")
+    if (message.role !== "toolResult" || message.isError || PROTECTED_TOOLS.test(message.toolName)
       || duplicates.has(message.toolCallId) || outputs.get(message.toolCallId) !== 1
       || "addedToolNames" in message || message.content.some(part => part.type !== "text")) continue;
     const input = calls.get(message.toolCallId);
@@ -166,8 +182,10 @@ function pairedOutputs(
     const matched = ownerMessage?.role === "assistant" && ownerMessage.content.some(block =>
       block.type === "toolCall" && record(block.arguments)
         && block.id === message.toolCallId && block.name === message.toolName);
-    if (!input || !matched || sensitiveInput(input) || redactSecrets(textOf(message)) !== textOf(message)
-      || (message.toolName === "bg_run" && !testRun(message, input))) continue;
+    // Supersede-only outputs never reach Jev, so upload screening does not apply to them.
+    const screened = SUPERSEDE_ONLY_TOOLS.has(message.toolName)
+      || (!sensitiveInput(input) && redactSecrets(textOf(message)) === textOf(message));
+    if (!input || !matched || !screened || (message.toolName === "bg_run" && !completedRun(message))) continue;
     const ref = reference(message);
     if (!refs.has(ref) && textOf(message).length >= minLength) results.push({ ref, result: message, input, index });
   }
@@ -179,23 +197,86 @@ export function candidates(
 ): Candidate[] {
   const all = pairedOutputs(messages, refs, keepRecentTokens, 2_000);
   const replaced = superseded(messages, all, refs);
-  return all.sort((a, b) => Number(replaced.has(b.ref)) - Number(replaced.has(a.ref))
-    || textOf(b.result).length - textOf(a.result).length).slice(0, 16);
+  return all.filter(item => !SUPERSEDE_ONLY_TOOLS.has(item.result.toolName) || replaced.has(item.ref))
+    .sort((a, b) => Number(replaced.has(b.ref)) - Number(replaced.has(a.ref))
+      || textOf(b.result).length - textOf(a.result).length).slice(0, 16);
 }
 
-/** Only a later complete read or successful identical test run can supersede an old result. */
+type Evidence = (result: ToolResult, input: Record<string, unknown>) => boolean;
+interface Supersession {
+  /** The state an output reports; outputs of one tool with equal subjects describe the same thing. */
+  subject(result: ToolResult, input: Record<string, unknown>): string | undefined;
+  /** Whether this output fully restates its subject, making earlier outputs of it redundant. */
+  complete: Evidence;
+}
+const always: Evidence = () => true;
+const field = (name: string) => (_result: ToolResult, input: Record<string, unknown>) =>
+  typeof input[name] === "string" ? input[name] : undefined;
+const testSubject = (result: ToolResult, input: Record<string, unknown>) =>
+  testRun(result, input) ? JSON.stringify([input.cwd, input.command]) : undefined;
+
+/** Tools whose later output provably replaces an earlier one; everything else needs Jev's judgment. */
+const SUPERSESSION: Readonly<Record<string, Supersession>> = {
+  read: { subject: field("path"), complete: completeRead },
+  bash: { subject: testSubject, complete: testRun },
+  bg_run: { subject: testSubject, complete: testRun },
+  // A checkpoint write carries its content in the call arguments, so any later checkpoint result replaces reads.
+  advisor_checkpoint: { subject: () => "checkpoint", complete: always },
+  advisor_graph_plan: { subject: field("graphId"), complete: always },
+  read_skill: { subject: field("path"), complete: always },
+  bg_list: { subject: () => "runs", complete: always },
+  bg_output: {
+    subject: (_result, input) => input.source !== "transcript" && input.grep === undefined && typeof input.runId === "string"
+      ? input.runId : undefined,
+    complete: always,
+  },
+  lens_diagnostics: { subject: (_result, input) => JSON.stringify(input, Object.keys(input).toSorted()), complete: always },
+};
+
+/** An earlier output is superseded only by a later complete output of the same tool and subject. */
 export function superseded(
   messages: readonly AgentMessage[], choices: readonly Candidate[], refs: ReadonlySet<string> = new Set(),
 ): Set<string> {
   const outputs = pairedOutputs(messages, refs, 0, 0);
   const indices = new Map(outputs.map(item => [item.ref, item.index]));
-  return new Set(choices.filter(old => outputs.some(next => next.index > (indices.get(old.ref) ?? Infinity)
-    && next.result.toolName === old.result.toolName
-    && (next.result.toolName === "read"
-      ? next.input.path === old.input.path && completeRead(next.result, next.input)
-      : testRun(old.result, old.input) && testRun(next.result, next.input)
-        && next.input.command === old.input.command && next.input.cwd === old.input.cwd)
-  )).map(item => item.ref));
+  return new Set(choices.filter(old => {
+    const rule = SUPERSESSION[old.result.toolName];
+    const subject = rule?.subject(old.result, old.input);
+    return rule !== undefined && subject !== undefined && outputs.some(next => next.index > (indices.get(old.ref) ?? Infinity)
+      && next.result.toolName === old.result.toolName
+      && rule.subject(next.result, next.input) === subject && rule.complete(next.result, next.input));
+  }).map(item => item.ref));
+}
+
+// Relative prompt-cache prices: a rewritten token costs a write instead of a read; a cleared token saves a read.
+const CACHE_READ = 0.1;
+const CACHE_REWRITE = 1.25 - CACHE_READ;
+
+/**
+ * Clearing an output changes the cached prompt from its position onward. Commit the newest-first subset that
+ * saves the most while its one-time rewrite repays within `maxPaybackTurns` later requests; older outputs wait
+ * for a batch large enough to justify invalidating everything after them.
+ */
+export function affordable(
+  messages: readonly AgentMessage[], refs: ReadonlySet<string>, cleared: readonly Candidate[], maxPaybackTurns: number,
+): Candidate[] {
+  const position = new Map(messages.flatMap((message, index) =>
+    message.role === "toolResult" ? [[reference(message), index] as const] : []));
+  const ordered = cleared.filter(item => position.has(item.ref))
+    .toSorted((a, b) => position.get(b.ref)! - position.get(a.ref)!);
+  let best: Candidate[] = [];
+  let bestSaved = 0;
+  for (let count = 1; count <= ordered.length; count++) {
+    const subset = ordered.slice(0, count);
+    const masked = applyPruning(messages, new Set([...refs, ...subset.map(item => item.ref)]));
+    const rewritten = masked.slice(position.get(subset.at(-1)!.ref)!).reduce((sum, message) => sum + estimateTokens(message), 0);
+    const saved = subset.reduce((sum, item) => sum + estimateTokens(item.result) - estimateTokens(masked[position.get(item.ref)!]!), 0);
+    if (saved > bestSaved && CACHE_REWRITE * rewritten <= maxPaybackTurns * CACHE_READ * saved) {
+      best = subset;
+      bestSaved = saved;
+    }
+  }
+  return best;
 }
 
 function excerpt(text: string, limit: number): string {

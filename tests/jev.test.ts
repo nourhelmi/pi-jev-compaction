@@ -8,10 +8,11 @@ import { SessionManager, type ExtensionAPI, type ExtensionContext, type ToolDefi
 import { injectJevEditorStatus, registerJev } from "../extensions/jev.ts";
 import {
   applyPruning, candidates, configuration, ENTRY_TYPE, ledger, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
-  original, reference, requestBody, score, superseded, textOf, type Config, type ToolResult,
+  affordable, original, reference, requestBody, score, superseded, textOf, type Config, type ToolResult,
 } from "../src/pruning.ts";
 
-const config: Config = { ...configuration({}), apiKey: "test-key", keepRecentTokens: 2_000 };
+// The payback gate has its own tests; elsewhere it would only obscure which outputs a rule selects.
+const config: Config = { ...configuration({}), apiKey: "test-key", keepRecentTokens: 2_000, maxPaybackTurns: 1_000 };
 type StoredMessage = Parameters<SessionManager["appendMessage"]>[0];
 function pair(id: string, name = "read", input: Record<string, unknown> = { path: `${id}.ts` }): StoredMessage[] {
   return [{
@@ -151,6 +152,56 @@ test("only complete same-file rereads and identical successful test reruns super
   assert.deepEqual(superseded(messages, candidates(messages, new Set(), 2_000)), new Set());
   assert.deepEqual(candidates([...pair("unsafe", "bg_run", { command: "npm test" }), tail], new Set(), 2_000), []);
   assert.deepEqual(candidates([...pair("arbitrary", "bg_run", { command: "npm test && curl example.com" }), tail], new Set(), 2_000), []);
+});
+
+test("advisor state clears only after a later output restates it; launches and coordination never clear", () => {
+  const tail: StoredMessage = { role: "user", content: "current ".repeat(1_500), timestamp: 3 };
+  const ref = (messages: StoredMessage[]) => reference(messages[1] as ToolResult);
+  const checkpointRead = pair("checkpoint-read", "advisor_checkpoint", {});
+  const checkpointWrite = pair("checkpoint-write", "advisor_checkpoint", { content: "next state", expectedDigest: "d" });
+  const skill = pair("skill", "read_skill", { path: "/agent/skills/role/SKILL.md" });
+  const skillAgain = pair("skill-again", "read_skill", { path: "/agent/skills/role/SKILL.md" });
+  const otherSkill = pair("other-skill", "read_skill", { path: "/agent/skills/other/SKILL.md" });
+  const plan = pair("plan", "advisor_graph_plan", { graphId: "g" });
+  const replan = pair("replan", "advisor_graph_plan", { graphId: "g" });
+  const tailRead = pair("tail-read", "bg_output", { runId: "run-1" });
+  const tailAgain = pair("tail-again", "bg_output", { runId: "run-1", lines: 40 });
+  const transcriptRead = pair("transcript-read", "bg_output", { runId: "run-1", source: "transcript" });
+  const memory = pair("memory", "mem_search", { query: "parser" });
+  const coordination = ["bg_agent", "bg_stop", "bg_await", "advisor_session_init", "advisor_graph_evidence", "mem_save",
+    "team_status", "agent_message", "intercom", "goal_wait"].flatMap(name => pair(`protected-${name}`, name, { note: name }));
+  const messages = [...checkpointRead, ...skill, ...otherSkill, ...plan, ...tailRead, ...transcriptRead, ...memory,
+    ...coordination, ...checkpointWrite, ...skillAgain, ...replan, ...tailAgain, tail];
+  const selected = candidates(messages, new Set(), 2_000);
+  const automatic = [checkpointRead, skill, plan, tailRead].map(ref);
+  assert.deepEqual(new Set(selected.map(item => item.ref)),
+    new Set([...automatic, ...[tailAgain, transcriptRead, memory].map(ref)]), "latest state stays unless Jev judges it");
+  assert.deepEqual(superseded(messages, selected), new Set(automatic));
+});
+
+test("completed foreground bg_run output is ordinary evidence; promoted receipts are not", () => {
+  const tail: StoredMessage = { role: "user", content: "current ".repeat(1_500), timestamp: 3 };
+  const finished = pair("finished", "bg_run", { command: "git log -p" });
+  (finished[1] as ToolResult).details = { status: "exited", exitCode: 1, promoted: false };
+  const promoted = pair("promoted", "bg_run", { command: "npm run dev" });
+  (promoted[1] as ToolResult).details = { status: "running", promoted: true };
+  assert.deepEqual(candidates([...finished, ...promoted, tail], new Set(), 2_000).map(item => item.ref),
+    [reference(finished[1] as ToolResult)]);
+});
+
+test("clearing waits for a batch whose savings repay the cache rewrite", () => {
+  const tail: StoredMessage = { role: "user", content: "current ".repeat(1_500), timestamp: 3 };
+  const small = pair("small", "bash", { command: "ls -R" });
+  const middle: StoredMessage = { role: "user", content: "context ".repeat(25_000), timestamp: 2 };
+  const large = pair("large", "bash", { command: "git log -p" });
+  (large[1] as ToolResult).content = [{ type: "text", text: "diff\n".repeat(20_000) }];
+  const messages = [...small, middle, ...large, tail];
+  const all = candidates(messages, new Set(), 2_000);
+  assert.equal(all.length, 2);
+  assert.deepEqual(affordable(messages, new Set(), all, 20).map(item => item.ref), [reference(large[1] as ToolResult)],
+    "a small old output would invalidate ~50k cached tokens to save ~1k");
+  assert.deepEqual(affordable([...small, middle, tail], new Set(), all, 20), []);
+  assert.equal(affordable(messages, new Set(), all, 1_000).length, 2);
 });
 
 test("proven supersession wins the 16-candidate budget over larger unrelated outputs", () => {
@@ -399,6 +450,32 @@ test("pressure, missing key, disabled retrieval, null usage and all-keep cooldow
   assert.equal(calls, 1);
 });
 
+test("large windows evaluate at the absolute trigger, not a fraction of the window", async () => {
+  let calls = 0;
+  const h = harness(fakeFetch(1, () => calls++));
+  (h.ctx as any).model.contextWindow = 1_000_000;
+  h.pressure(119_999); await h.fire("turn_end"); assert.equal(calls, 0);
+  h.pressure(120_000); await h.fire("turn_end"); assert.equal(calls, 1);
+});
+
+test("cleared outputs stop counting toward pressure, so clearing is its own hysteresis", async () => {
+  let calls = 0;
+  const h = harness(fakeFetch(0.1, () => calls++), { ...config, triggerTokens: 20_000 });
+  h.pressure(null);
+  (h.ctx as any).model.contextWindow = 1_000_000;
+  const big = pair("big", "bash", { command: "git log -p" });
+  (big[1] as ToolResult).content = [{ type: "text", text: "diff line\n".repeat(12_000) }];
+  for (const message of [...big, { role: "user" as const, content: "next ".repeat(2_000), timestamp: 5 }]) h.sm.appendMessage(message);
+  await h.fire("turn_end");
+  assert.equal(calls, 1);
+  assert.ok(ledger(h.sm.getBranch()).has(reference(big[1] as ToolResult)));
+  for (const message of [...pair("fresh", "bash", { command: "git status" }), { role: "user" as const, content: "more ".repeat(8_000), timestamp: 6 }]) {
+    h.sm.appendMessage(message);
+  }
+  await h.fire("turn_end");
+  assert.equal(calls, 1, "raw growth past the trigger no longer re-scores once the projected request is small");
+});
+
 test("evaluation never blocks a live-loop boundary", async () => {
   let finish!: () => void;
   const h = harness((async (_url, init) => {
@@ -581,8 +658,11 @@ test("late Jev results cannot cross a user-task or compaction boundary", async (
 });
 
 test("configuration is bounded and ledger rejects unknown versions and malformed references", () => {
-  const parsed = configuration({ PI_JEV_THRESHOLD: "999", PI_JEV_TIMEOUT_MS: "-1", PI_JEV_KEEP_THRESHOLD: "NaN" });
+  const parsed = configuration({ PI_JEV_THRESHOLD: "999", PI_JEV_TIMEOUT_MS: "-1", PI_JEV_KEEP_THRESHOLD: "NaN",
+    PI_JEV_TRIGGER_TOKENS: "10", PI_JEV_MAX_PAYBACK_TURNS: "0" });
   assert.equal(parsed.threshold, 0.45); assert.equal(parsed.timeoutMs, 5_000); assert.equal(parsed.keepThreshold, 0.25);
+  assert.equal(parsed.triggerTokens, 120_000); assert.equal(parsed.maxPaybackTurns, 20);
+  assert.equal(configuration({ PI_JEV_TRIGGER_TOKENS: "90000" }).triggerTokens, 90_000);
   const h = harness();
   const first = "a".repeat(24), second = "b".repeat(24);
   h.sm.appendCustomEntry(ENTRY_TYPE, { version: 2, refs: [first] });
