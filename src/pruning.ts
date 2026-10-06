@@ -3,7 +3,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { estimateTokens, type SessionEntry } from "@earendil-works/pi-coding-agent";
 
 export const ENTRY_TYPE = "pi-jev-pruning";
-export const ENDPOINT = "https://api.typesafe.ai/v1/systemone";
+export const ENDPOINT = "https://api.openjev.sh/v1/systemone";
 export const MAX_REQUEST_BYTES = 24_000;
 export const MAX_RESPONSE_BYTES = 64_000;
 export const GROWTH_TOKENS = 8_000;
